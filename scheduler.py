@@ -1,4 +1,4 @@
-"""Scheduler — Registers the weekly music scan job.
+"""Scheduler — Registers the 3x/week music scan jobs.
 
 When integrated into oni-hub, this is imported in src/main.py:
     from src.monitors.music.scheduler import start_music_monitor
@@ -21,27 +21,30 @@ _DAY_MAP = {
     "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
 }
 
+# Run index for each day of the week (for seed/genre rotation)
+_RUN_INDEX = {"sun": 0, "tue": 1, "thu": 2}
 
-def _run_scan_job() -> None:
+
+def _run_scan_job(run_index: int = None) -> None:
     """Job callback — runs the full music scan pipeline.
 
     Called by APScheduler on the configured schedule.
     All errors are handled internally; this function never raises.
     """
-    logger.info("Scheduled music scan starting...")
+    logger.info("Scheduled music scan starting (run_index=%s)...", run_index)
     try:
         from scanner import run_music_scan
-        result = run_music_scan()
+        result = run_music_scan(run_index=run_index)
 
-        if result.get("playlist"):
-            logger.info("Scheduled scan complete: playlist created with %d tracks (%.1fs)",
-                        result["playlist"]["track_count"], result["duration_sec"])
+        if result.get("playlists"):
+            total_tracks = sum(p["track_count"] for p in result["playlists"])
+            logger.info("Scheduled scan complete: %d playlists, %d total tracks (%.1fs)",
+                        len(result["playlists"]), total_tracks, result["duration_sec"])
         else:
-            logger.warning("Scheduled scan complete but no playlist created. Errors: %s",
+            logger.warning("Scheduled scan complete but no playlists created. Errors: %s",
                            result.get("errors", []))
     except Exception as e:
         logger.error("Scheduled music scan crashed: %s", e)
-        # Try to notify about the crash
         try:
             from notification import format_error_notification
             from scanner import _try_send_telegram, _try_track_error
@@ -53,36 +56,45 @@ def _run_scan_job() -> None:
 
 
 def start_music_monitor(scheduler) -> None:
-    """Register the weekly music scan job on an existing APScheduler.
+    """Register the 3x/week music scan jobs on an existing APScheduler.
 
     Args:
         scheduler: APScheduler BackgroundScheduler instance (shared with oni-hub).
 
     Schedule is configured via env vars:
-        MUSIC_SCAN_DAY  (default: fri)
-        MUSIC_SCAN_HOUR (default: 18 = 6 PM)
+        MUSIC_SCAN_DAYS  (default: "sun,tue,thu")
+        MUSIC_SCAN_HOUR  (default: 21 = 9 PM)
     """
     from apscheduler.triggers.cron import CronTrigger
 
-    day = _DAY_MAP.get(config.MUSIC_SCAN_DAY.lower(), "fri")
+    days_str = getattr(config, "MUSIC_SCAN_DAYS", "sun,tue,thu")
     hour = config.MUSIC_SCAN_HOUR
+    tz = getattr(config, "TIMEZONE", "US/Eastern")
 
-    trigger = CronTrigger(
-        day_of_week=day,
-        hour=hour,
-        minute=0,
-        timezone=getattr(config, "TIMEZONE", "US/Eastern"),
-    )
+    days = [d.strip().lower() for d in days_str.split(",") if d.strip()]
 
-    scheduler.add_job(
-        _run_scan_job,
-        trigger=trigger,
-        id="music_scan",
-        name="Weekly Music Discovery Scan",
-        replace_existing=True,
-    )
+    for day_raw in days:
+        day = _DAY_MAP.get(day_raw, day_raw)
+        run_index = _RUN_INDEX.get(day)
+        job_id = f"music_scan_{day}"
 
-    logger.info("Music monitor scheduled: every %s at %02d:00", day, hour)
+        trigger = CronTrigger(
+            day_of_week=day,
+            hour=hour,
+            minute=0,
+            timezone=tz,
+        )
+
+        scheduler.add_job(
+            _run_scan_job,
+            trigger=trigger,
+            id=job_id,
+            name=f"Music Discovery Scan ({day.capitalize()})",
+            kwargs={"run_index": run_index},
+            replace_existing=True,
+        )
+
+        logger.info("Music scan scheduled: %s at %02d:00 (run_index=%s)", day, hour, run_index)
 
 
 if __name__ == "__main__":
@@ -103,12 +115,16 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Candidates discovered: {result['candidates_discovered']}")
     print(f"Candidates scored:     {result['candidates_scored']}")
-    if result["playlist"]:
-        p = result["playlist"]
-        print(f"Playlist: {p['name']} ({p['track_count']} tracks)")
-        print(f"URL: {p['url']}")
+    if result["playlists"]:
+        for p in result["playlists"]:
+            print(f"Playlist: {p['name']} ({p['track_count']} tracks)")
+            print(f"  URL: {p['url']}")
     else:
-        print("Playlist: not created")
+        print("Playlists: none created")
+    if result.get("fresh_playlist"):
+        fp = result["fresh_playlist"]
+        print(f"Fresh Finds: {fp['name']} ({fp['track_count']} tracks)")
+        print(f"  URL: {fp['url']}")
     if result["errors"]:
         print(f"Errors: {result['errors']}")
     print(f"Duration: {result['duration_sec']}s")

@@ -388,8 +388,14 @@ def filter_already_recommended(
 
 def run_discovery(
     sp: spotipy.Spotify,
+    run_index: int = None,
 ) -> List[Dict[str, Any]]:
     """Run the full discovery pipeline.
+
+    Args:
+        sp: Authenticated Spotify client
+        run_index: 0, 1, or 2 — rotates which seeds/genres drive discovery.
+                   None = use all (backwards compatible).
 
     Returns scored and ranked candidates ready for playlist building.
     """
@@ -403,22 +409,24 @@ def run_discovery(
         logger.error("No taste profile found. Run taste profiler first.")
         return []
 
-    logger.info("Loaded taste profile: %d genres, %d seed artists",
-                len(genre_weights), len(seed_ids))
+    logger.info("Loaded taste profile: %d genres, %d seed artists (run_index=%s)",
+                len(genre_weights), len(seed_ids), run_index)
+
+    # Rotate seeds and genres based on run_index for variety across runs
+    rotated_seeds = _rotate_seeds(seed_artists, run_index)
+    rotated_weights = _rotate_genres(genre_weights, run_index)
 
     # Gather candidates from all sources
     all_candidates = []
 
     # Source 1: MusicBrainz tag search
-    mb_candidates = discover_from_musicbrainz(genre_weights, seed_ids)
+    mb_candidates = discover_from_musicbrainz(rotated_weights, seed_ids)
     all_candidates.extend(mb_candidates)
 
-    # Source 2: Spotify search (skipped — burns API calls, MusicBrainz + Last.fm sufficient)
-    # sp_candidates = discover_from_spotify_search(sp, genre_weights, seed_ids)
-    # all_candidates.extend(sp_candidates)
+    # Source 2: Spotify search (skipped — burns API calls)
 
     # Source 3: Last.fm (if configured)
-    lfm_candidates = discover_from_lastfm(genre_weights, seed_artists)
+    lfm_candidates = discover_from_lastfm(rotated_weights, rotated_seeds)
     all_candidates.extend(lfm_candidates)
 
     if not all_candidates:
@@ -452,10 +460,9 @@ def run_discovery(
     scored = score_candidates(candidates, genre_weights)
     logger.info("Scored %d candidates pre-Spotify resolution", len(scored))
 
-    # Only resolve Spotify IDs for the top candidates (saves API calls).
-    # 40 is enough — we need 25 for the playlist, plus buffer for cache hits
-    # and candidates that won't be found on Spotify.
-    top_n = min(len(scored), 40)
+    # Resolve Spotify IDs for top candidates. 80 for 50-track playlists
+    # across multiple genre clusters, plus buffer.
+    top_n = min(len(scored), 80)
     top_candidates = scored[:top_n]
     logger.info("Resolving Spotify IDs for top %d candidates...", top_n)
     resolved = resolve_spotify_ids(sp, top_candidates, seed_ids)
@@ -468,6 +475,61 @@ def run_discovery(
 
     logger.info("Discovery complete: %d scored candidates with Spotify IDs", len(resolved))
     return resolved
+
+
+def _rotate_seeds(
+    seed_artists: List[Dict[str, Any]],
+    run_index: int = None,
+) -> List[Dict[str, Any]]:
+    """Rotate which seed artists drive similar-artist search.
+
+    Run 0 (Sun): seeds 0-14
+    Run 1 (Tue): seeds 15-29
+    Run 2 (Thu): seeds 30-44
+    None: all seeds (backwards compatible)
+    """
+    if run_index is None:
+        return seed_artists
+
+    start = run_index * 15
+    end = start + 15
+    rotated = seed_artists[start:end]
+
+    # If not enough seeds in this slice, wrap around
+    if len(rotated) < 10 and len(seed_artists) > 0:
+        rotated = seed_artists[start:] + seed_artists[:max(10 - len(rotated), 0)]
+
+    logger.info("  Run %d: using seeds %d-%d (%d artists)",
+                run_index, start, start + len(rotated) - 1, len(rotated))
+    return rotated
+
+
+def _rotate_genres(
+    genre_weights: Dict[str, float],
+    run_index: int = None,
+) -> Dict[str, float]:
+    """Rotate which genre slice drives tag-based discovery.
+
+    Run 0 (Sun): genres 0-19
+    Run 1 (Tue): genres 5-24
+    Run 2 (Thu): genres 10-29
+    None: all genres (backwards compatible)
+    """
+    if run_index is None:
+        return genre_weights
+
+    sorted_genres = sorted(genre_weights.items(), key=lambda x: -x[1])
+    start = run_index * 5
+    end = start + 20
+    sliced = sorted_genres[start:end]
+
+    # If not enough genres, wrap
+    if len(sliced) < 15 and len(sorted_genres) > 0:
+        sliced = sorted_genres[start:] + sorted_genres[:max(15 - len(sliced), 0)]
+
+    logger.info("  Run %d: using genres %d-%d (%d genres)",
+                run_index, start, start + len(sliced) - 1, len(sliced))
+    return dict(sliced)
 
 
 def _filter_mainstream(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

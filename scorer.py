@@ -144,18 +144,72 @@ def compute_source_diversity(candidate: Dict[str, Any]) -> float:
 def compute_momentum_score(candidate: Dict[str, Any]) -> float:
     """Score 0-1 based on listener growth momentum.
 
-    Phase 5 feature — returns 0.5 (neutral) until listener snapshots are available.
+    Compares current Last.fm listeners to a previous snapshot.
+    >20% growth = 1.0 (breakout), 10-20% = 0.8, 0-10% = 0.6,
+    declining = 0.3, no data = 0.5 (neutral).
     """
-    return 0.5
+    current = candidate.get("lastfm_listeners", 0)
+    previous = candidate.get("previous_listeners", 0)
+
+    if not current or not previous:
+        return 0.5  # no data — neutral
+
+    if previous == 0:
+        return 0.8  # new artist with listeners = positive signal
+
+    growth = (current - previous) / previous
+
+    if growth > 0.20:
+        return 1.0  # breakout
+    elif growth > 0.10:
+        return 0.8
+    elif growth > 0.0:
+        return 0.6
+    else:
+        return 0.3  # declining
+
+
+def compute_feedback_boost(
+    candidate: Dict[str, Any],
+    liked_genres: Dict[str, int] = None,
+) -> float:
+    """Small composite boost for candidates whose genres were positively received.
+
+    Returns a bonus (0.0-0.05) based on how many of the candidate's genres
+    appear in the liked genres from feedback.
+    """
+    if not liked_genres:
+        return 0.0
+
+    candidate_genres = candidate.get("genres", [])
+    if isinstance(candidate_genres, str):
+        import json
+        try:
+            candidate_genres = json.loads(candidate_genres)
+        except (json.JSONDecodeError, TypeError):
+            return 0.0
+
+    matches = sum(1 for g in candidate_genres if g.lower().strip() in liked_genres)
+    if matches == 0:
+        return 0.0
+
+    # Cap at 0.05 boost
+    return min(matches * 0.02, 0.05)
 
 
 def score_candidates(
     candidates: List[Dict[str, Any]],
     genre_weights: Dict[str, float],
+    liked_genres: Dict[str, int] = None,
 ) -> List[Dict[str, Any]]:
     """Score all candidates and return them sorted by composite score descending.
 
     Filters out candidates below the minimum genre match threshold.
+
+    Args:
+        candidates: List of candidate dicts
+        genre_weights: Taste profile weights
+        liked_genres: {genre: count} from feedback for bonus scoring (optional)
     """
     scored = []
 
@@ -178,10 +232,15 @@ def score_candidates(
             + momentum_score * WEIGHT_MOMENTUM
         )
 
+        # Feedback boost
+        fb_boost = compute_feedback_boost(candidate, liked_genres)
+        composite += fb_boost
+
         candidate["genre_match_score"] = round(genre_score, 4)
         candidate["popularity_score"] = round(pop_score, 4)
         candidate["source_diversity_bonus"] = round(source_score, 4)
         candidate["momentum_score"] = round(momentum_score, 4)
+        candidate["feedback_boost"] = round(fb_boost, 4)
         candidate["composite_score"] = round(composite, 4)
         scored.append(candidate)
 

@@ -91,7 +91,26 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add Phase 5 columns via ALTER TABLE (idempotent)."""
+    migrations = [
+        ("recommendations", "feedback_checked", "INTEGER DEFAULT 0"),
+        ("recommendations", "artist_name", "TEXT"),
+        ("recommendations", "artist_genres", "TEXT"),
+        ("recommendations", "release_date", "TEXT"),
+        ("feedback", "track_spotify_id", "TEXT"),
+        ("feedback", "genres", "TEXT"),
+        ("playlist_history", "genre_cluster", "TEXT"),
+    ]
+    for table, column, col_type in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 def save_taste_profile(genre_weights: Dict[str, float]) -> None:
@@ -279,5 +298,148 @@ def cache_spotify_ids_bulk(mappings: List[Tuple[str, str]]) -> None:
         )
         conn.commit()
         logger.info("Cached %d Spotify IDs", len(mappings))
+    finally:
+        conn.close()
+
+
+# --- Phase 5: Feedback & Momentum ---
+
+def get_unchecked_recommendations(min_age_days: int = 7) -> List[Dict[str, Any]]:
+    """Get recommendations older than min_age_days that haven't been feedback-checked."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT id, artist_spotify_id, track_spotify_id, artist_name,
+                      artist_genres, recommended_at
+               FROM recommendations
+               WHERE feedback_checked = 0
+                 AND recommended_at < datetime('now', ?)""",
+            (f"-{min_age_days} days",),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_recommendations_checked(rec_ids: List[int]) -> None:
+    """Flag recommendations as feedback-processed."""
+    if not rec_ids:
+        return
+    conn = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in rec_ids)
+        conn.execute(
+            f"UPDATE recommendations SET feedback_checked = 1 WHERE id IN ({placeholders})",
+            rec_ids,
+        )
+        conn.commit()
+        logger.info("Marked %d recommendations as feedback-checked", len(rec_ids))
+    finally:
+        conn.close()
+
+
+def save_feedback_batch(records: List[Dict[str, Any]]) -> None:
+    """Bulk insert feedback records.
+
+    Each record: {artist_spotify_id, track_spotify_id, feedback_type, genres}
+    """
+    if not records:
+        return
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """INSERT INTO feedback
+               (artist_spotify_id, feedback_type, track_spotify_id, genres)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (r["artist_spotify_id"], r["feedback_type"],
+                 r.get("track_spotify_id"), r.get("genres"))
+                for r in records
+            ],
+        )
+        conn.commit()
+        logger.info("Saved %d feedback records", len(records))
+    finally:
+        conn.close()
+
+
+def adjust_taste_profile(adjustments: Dict[str, float]) -> None:
+    """Apply genre weight deltas and renormalize to 0-1.
+
+    adjustments: {genre: delta} where delta can be positive or negative.
+    """
+    if not adjustments:
+        return
+    conn = get_connection()
+    try:
+        # Load current profile
+        rows = conn.execute("SELECT genre, weight FROM taste_profile").fetchall()
+        weights = {r["genre"]: r["weight"] for r in rows}
+
+        # Apply deltas
+        for genre, delta in adjustments.items():
+            current = weights.get(genre, 0.0)
+            weights[genre] = max(current + delta, 0.01)  # floor at 0.01
+
+        # Renormalize to 0-1
+        max_w = max(weights.values()) if weights else 1.0
+        if max_w > 0:
+            weights = {g: w / max_w for g, w in weights.items()}
+
+        # Save
+        conn.execute("DELETE FROM taste_profile")
+        conn.executemany(
+            "INSERT INTO taste_profile (genre, weight) VALUES (?, ?)",
+            list(weights.items()),
+        )
+        conn.commit()
+        logger.info("Adjusted taste profile: %d changes, %d total genres",
+                    len(adjustments), len(weights))
+    finally:
+        conn.close()
+
+
+def save_listener_snapshots(snapshots: List[Tuple[str, int]]) -> None:
+    """Save listener count snapshots. snapshots = [(artist_spotify_id, listeners), ...]."""
+    if not snapshots:
+        return
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """INSERT INTO listener_snapshots (artist_spotify_id, monthly_listeners)
+               VALUES (?, ?)""",
+            snapshots,
+        )
+        conn.commit()
+        logger.info("Saved %d listener snapshots", len(snapshots))
+    finally:
+        conn.close()
+
+
+def get_listener_snapshots(artist_ids: List[str], days_back: int = 14) -> Dict[str, int]:
+    """Get the most recent previous listener snapshot for each artist.
+
+    Returns {artist_spotify_id: monthly_listeners} for snapshots within days_back.
+    """
+    if not artist_ids:
+        return {}
+    conn = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in artist_ids)
+        rows = conn.execute(
+            f"""SELECT artist_spotify_id, monthly_listeners
+                FROM listener_snapshots
+                WHERE artist_spotify_id IN ({placeholders})
+                  AND snapshot_date >= date('now', ?)
+                ORDER BY snapshot_date DESC""",
+            artist_ids + [f"-{days_back} days"],
+        ).fetchall()
+        # Return the most recent snapshot per artist
+        result = {}
+        for r in rows:
+            aid = r["artist_spotify_id"]
+            if aid not in result:
+                result[aid] = r["monthly_listeners"]
+        return result
     finally:
         conn.close()

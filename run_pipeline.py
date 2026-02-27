@@ -127,7 +127,11 @@ def run_full():
 
     if result["notification_text"]:
         print(f"\n--- Telegram Notification ---")
-        print(result["notification_text"])
+        # Handle non-ASCII artist names on Windows console (cp1252)
+        try:
+            print(result["notification_text"])
+        except UnicodeEncodeError:
+            print(result["notification_text"].encode("utf-8", errors="replace").decode("utf-8"))
         print(f"--- End ---")
 
     return 0 if result.get("playlists") else 1

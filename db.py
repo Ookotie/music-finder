@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS spotify_id_cache (
     spotify_id TEXT,
     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS rss_articles_seen (
+    article_url TEXT PRIMARY KEY,
+    blog_name TEXT,
+    artist_extracted TEXT,
+    seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -441,5 +448,56 @@ def get_listener_snapshots(artist_ids: List[str], days_back: int = 14) -> Dict[s
             if aid not in result:
                 result[aid] = r["monthly_listeners"]
         return result
+    finally:
+        conn.close()
+
+
+# --- RSS Article Deduplication ---
+
+def get_seen_article_urls() -> set:
+    """Return set of article URLs already processed."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT article_url FROM rss_articles_seen").fetchall()
+        return {r["article_url"] for r in rows}
+    finally:
+        conn.close()
+
+
+def save_seen_articles(articles: List[Dict[str, str]]) -> None:
+    """Save processed RSS articles.
+
+    Each article: {url, blog_name, artist_extracted}
+    """
+    if not articles:
+        return
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """INSERT OR IGNORE INTO rss_articles_seen
+               (article_url, blog_name, artist_extracted)
+               VALUES (?, ?, ?)""",
+            [(a["url"], a["blog_name"], a.get("artist_extracted", ""))
+             for a in articles],
+        )
+        conn.commit()
+        logger.info("Saved %d seen RSS articles", len(articles))
+    finally:
+        conn.close()
+
+
+def cleanup_old_articles(max_age_days: int = 90) -> int:
+    """Remove articles older than max_age_days. Returns count deleted."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM rss_articles_seen WHERE seen_at < datetime('now', ?)",
+            (f"-{max_age_days} days",),
+        )
+        conn.commit()
+        deleted = cursor.rowcount
+        if deleted:
+            logger.info("Cleaned up %d old RSS articles", deleted)
+        return deleted
     finally:
         conn.close()

@@ -271,6 +271,48 @@ def discover_from_lastfm(
     return result
 
 
+def discover_from_bandcamp(
+    genre_weights: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """Discover candidates from Bandcamp's public discover API.
+
+    Uses lazy import — returns empty list if requests is unavailable.
+    Zero Spotify API calls.
+    """
+    try:
+        import bandcamp_client
+    except ImportError:
+        logger.info("bandcamp_client not available — skipping Bandcamp discovery")
+        return []
+
+    logger.info("Discovering from Bandcamp...")
+    try:
+        return bandcamp_client.discover_artists(genre_weights)
+    except Exception as e:
+        logger.warning("Bandcamp discovery failed: %s", e)
+        return []
+
+
+def discover_from_blogs() -> List[Dict[str, Any]]:
+    """Discover candidates from music blog RSS feeds.
+
+    Uses lazy import — returns empty list if feedparser is unavailable.
+    Zero Spotify API calls.
+    """
+    try:
+        import rss_client
+    except ImportError:
+        logger.info("rss_client not available — skipping blog RSS discovery")
+        return []
+
+    logger.info("Discovering from music blog RSS feeds...")
+    try:
+        return rss_client.extract_artists_from_feeds()
+    except Exception as e:
+        logger.warning("Blog RSS discovery failed: %s", e)
+        return []
+
+
 def resolve_spotify_ids(
     sp: spotipy.Spotify,
     candidates: List[Dict[str, Any]],
@@ -428,6 +470,20 @@ def run_discovery(
     # Source 3: Last.fm (if configured)
     lfm_candidates = discover_from_lastfm(rotated_weights, rotated_seeds)
     all_candidates.extend(lfm_candidates)
+
+    # Source 4: Bandcamp (no API key, no Spotify calls)
+    try:
+        bc_candidates = discover_from_bandcamp(rotated_weights)
+        all_candidates.extend(bc_candidates)
+    except Exception as e:
+        logger.warning("Bandcamp source failed (non-fatal): %s", e)
+
+    # Source 5: Music blog RSS feeds (no API key, no Spotify calls)
+    try:
+        blog_candidates = discover_from_blogs()
+        all_candidates.extend(blog_candidates)
+    except Exception as e:
+        logger.warning("Blog RSS source failed (non-fatal): %s", e)
 
     if not all_candidates:
         logger.error("No candidates discovered from any source")

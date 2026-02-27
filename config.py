@@ -39,6 +39,13 @@ FEEDBACK_PENALTY = float(os.getenv("FEEDBACK_PENALTY", "0.02"))
 # Genre clustering
 MIN_CLUSTER_SIZE = int(os.getenv("MIN_CLUSTER_SIZE", "5"))
 
+# Bandcamp discovery
+BANDCAMP_GENRES_PER_RUN = int(os.getenv("BANDCAMP_GENRES_PER_RUN", "8"))
+BANDCAMP_SORT = os.getenv("BANDCAMP_SORT", "new")  # "new", "top", "rec"
+
+# Music blog RSS discovery
+BLOG_RSS_MAX_AGE_DAYS = int(os.getenv("BLOG_RSS_MAX_AGE_DAYS", "30"))
+
 # Taste profiler weights — how much each time range contributes to genre map
 TIME_RANGE_WEIGHTS = {
     "short_term": 0.5,   # Last 4 weeks — strongest signal of current taste

@@ -89,6 +89,24 @@ CREATE TABLE IF NOT EXISTS rss_articles_seen (
     artist_extracted TEXT,
     seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS track_cache (
+    artist_spotify_id TEXT NOT NULL,
+    track_id TEXT NOT NULL,
+    track_name TEXT,
+    artist_name TEXT,
+    duration_ms INTEGER DEFAULT 0,
+    preview_url TEXT,
+    release_date TEXT,
+    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (artist_spotify_id, track_id)
+);
+
+CREATE TABLE IF NOT EXISTS spotlight_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    genre_family TEXT NOT NULL,
+    used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -112,6 +130,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         ("feedback", "track_spotify_id", "TEXT"),
         ("feedback", "genres", "TEXT"),
         ("playlist_history", "genre_cluster", "TEXT"),
+        ("recommendations", "playlist_type", "TEXT"),
     ]
     for table, column, col_type in migrations:
         try:
@@ -499,5 +518,129 @@ def cleanup_old_articles(max_age_days: int = 90) -> int:
         if deleted:
             logger.info("Cleaned up %d old RSS articles", deleted)
         return deleted
+    finally:
+        conn.close()
+
+
+# --- Track Cache ---
+
+def get_cached_tracks(artist_ids: List[str], max_age_days: int = 7) -> Dict[str, Dict[str, Any]]:
+    """Get cached tracks for artists. Returns {artist_spotify_id: track_dict}."""
+    if not artist_ids:
+        return {}
+    conn = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in artist_ids)
+        rows = conn.execute(
+            f"""SELECT artist_spotify_id, track_id, track_name, artist_name,
+                       duration_ms, preview_url, release_date
+                FROM track_cache
+                WHERE artist_spotify_id IN ({placeholders})
+                  AND cached_at > datetime('now', ?)""",
+            artist_ids + [f"-{max_age_days} days"],
+        ).fetchall()
+        result = {}
+        for r in rows:
+            aid = r["artist_spotify_id"]
+            if aid not in result:
+                result[aid] = {
+                    "track_id": r["track_id"],
+                    "track_name": r["track_name"],
+                    "artist_name": r["artist_name"],
+                    "duration_ms": r["duration_ms"],
+                    "preview_url": r["preview_url"],
+                    "release_date": r["release_date"],
+                }
+        return result
+    finally:
+        conn.close()
+
+
+def cache_tracks(tracks: List[Dict[str, Any]]) -> None:
+    """Cache artist→track mappings. Each track: {artist_spotify_id, track_id, ...}."""
+    if not tracks:
+        return
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """INSERT INTO track_cache
+               (artist_spotify_id, track_id, track_name, artist_name,
+                duration_ms, preview_url, release_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(artist_spotify_id, track_id) DO UPDATE SET
+                 cached_at=CURRENT_TIMESTAMP""",
+            [
+                (t["artist_spotify_id"], t["track_id"], t.get("track_name"),
+                 t.get("artist_name"), t.get("duration_ms", 0),
+                 t.get("preview_url"), t.get("release_date"))
+                for t in tracks
+            ],
+        )
+        conn.commit()
+        logger.info("Cached %d tracks", len(tracks))
+    finally:
+        conn.close()
+
+
+# --- Per-Playlist Cooldowns ---
+
+def get_recently_recommended(cooldown_weeks: int, playlist_type: str = None) -> set:
+    """Get artist IDs recommended within cooldown period, optionally filtered by playlist type."""
+    conn = get_connection()
+    try:
+        if playlist_type:
+            rows = conn.execute(
+                """SELECT DISTINCT artist_spotify_id FROM recommendations
+                   WHERE recommended_at > datetime('now', ?)
+                     AND playlist_type = ?""",
+                (f"-{cooldown_weeks * 7} days", playlist_type),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT DISTINCT artist_spotify_id FROM recommendations
+                   WHERE recommended_at > datetime('now', ?)""",
+                (f"-{cooldown_weeks * 7} days",),
+            ).fetchall()
+        return {r["artist_spotify_id"] for r in rows}
+    finally:
+        conn.close()
+
+
+# --- Spotlight History ---
+
+def get_last_spotlight_genre() -> Optional[str]:
+    """Get the most recently used spotlight genre family."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT genre_family FROM spotlight_history ORDER BY used_at DESC LIMIT 1"
+        ).fetchone()
+        return row["genre_family"] if row else None
+    finally:
+        conn.close()
+
+
+def save_spotlight_genre(genre_family: str) -> None:
+    """Record a genre family as used for spotlight."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO spotlight_history (genre_family) VALUES (?)",
+            (genre_family,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_spotlight_history(limit: int = 10) -> List[str]:
+    """Get recent spotlight genre families (most recent first)."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT genre_family FROM spotlight_history ORDER BY used_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r["genre_family"] for r in rows]
     finally:
         conn.close()

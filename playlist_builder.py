@@ -1,6 +1,7 @@
 """Playlist Builder — Creates Spotify playlists from scored candidates.
 
-Phase 3: Single playlist. Phase 5: Multi-playlist (genre clusters + fresh finds).
+Multi-playlist pipeline: Rising Stars, Deep Cuts, Genre Spotlight.
+Uses track caching to minimize API calls on subsequent runs.
 
 Note: Spotify's Feb 2026 API changes deprecated several endpoints used by
 spotipy. We bypass spotipy for playlist creation and track addition, calling
@@ -61,7 +62,6 @@ def get_top_track(
 
 def _track_dict(item: Dict, artist_name: str) -> Dict[str, Any]:
     """Build a track dict from a Spotify search result item."""
-    # Extract release date from album
     album = item.get("album", {})
     release_date = album.get("release_date", "")
 
@@ -80,15 +80,23 @@ def fetch_tracks_for_candidates(
     candidates: List[Dict[str, Any]],
     max_tracks: int = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch top tracks for a list of candidates.
+    """Fetch top tracks for candidates. Uses cache first, then API for misses.
 
-    Returns track dicts enriched with artist metadata.
+    Candidates with a `_rec_track` field (from Spotify recommendations) skip
+    the API call entirely — the track was already fetched during discovery.
     """
     if max_tracks is None:
         max_tracks = config.PLAYLIST_SIZE
 
+    # Check track cache for all candidates with Spotify IDs
+    artist_ids = [c["spotify_id"] for c in candidates if c.get("spotify_id")]
+    cached_tracks = db.get_cached_tracks(artist_ids) if artist_ids else {}
+    cache_hits = 0
+
     tracks = []
     skipped = 0
+    new_cache_entries = []
+
     for candidate in candidates:
         if len(tracks) >= max_tracks:
             break
@@ -98,6 +106,32 @@ def fetch_tracks_for_candidates(
             skipped += 1
             continue
 
+        # Priority 1: Pre-attached track from Spotify recommendations
+        rec_track = candidate.get("_rec_track")
+        if rec_track:
+            track = rec_track.copy()
+            track["artist_spotify_id"] = sid
+            track["composite_score"] = candidate.get("composite_score", 0)
+            track["genre_match_score"] = candidate.get("genre_match_score", 0)
+            track["artist_name"] = candidate.get("name", track.get("artist_name", ""))
+            track["artist_genres"] = json.dumps(candidate.get("genres", []))
+            tracks.append(track)
+            new_cache_entries.append(track)
+            continue
+
+        # Priority 2: Cached track
+        if sid in cached_tracks:
+            track = cached_tracks[sid].copy()
+            track["artist_spotify_id"] = sid
+            track["composite_score"] = candidate.get("composite_score", 0)
+            track["genre_match_score"] = candidate.get("genre_match_score", 0)
+            track["artist_name"] = candidate.get("name", track.get("artist_name", ""))
+            track["artist_genres"] = json.dumps(candidate.get("genres", []))
+            tracks.append(track)
+            cache_hits += 1
+            continue
+
+        # Priority 3: API call
         try:
             track = get_top_track(sp, candidate["name"], sid)
         except Exception:
@@ -110,26 +144,72 @@ def fetch_tracks_for_candidates(
             track["genre_match_score"] = candidate.get("genre_match_score", 0)
             track["artist_name"] = candidate.get("name", track.get("artist_name", ""))
             track["artist_genres"] = json.dumps(candidate.get("genres", []))
-            track["genre_cluster"] = candidate.get("genre_cluster", "Mixed")
             tracks.append(track)
+            new_cache_entries.append(track)
         else:
             skipped += 1
 
-    logger.info("Fetched %d tracks (%d skipped)", len(tracks), skipped)
+    # Save new tracks to cache
+    if new_cache_entries:
+        db.cache_tracks(new_cache_entries)
+
+    logger.info("Fetched %d tracks (%d cache hits, %d skipped)", len(tracks), cache_hits, skipped)
     return tracks
 
+
+def build_playlist_from_profile(
+    sp: spotipy.Spotify,
+    candidates: List[Dict[str, Any]],
+    playlist_type: str,
+    target_size: int,
+    playlist_name: str,
+    description: str = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a Spotify playlist from scored candidates for a specific profile.
+
+    Args:
+        sp: Authenticated Spotify client
+        candidates: Pre-scored and filtered candidates for this playlist type
+        playlist_type: "rising_stars", "deep_cuts", or "genre_spotlight"
+        target_size: Target number of tracks
+        playlist_name: Full playlist name
+        description: Playlist description
+
+    Returns:
+        Dict with playlist metadata or None on failure.
+    """
+    if not candidates:
+        logger.warning("No candidates for %s playlist", playlist_type)
+        return None
+
+    # Fetch tracks (uses cache + pre-attached tracks from recommendations)
+    tracks = fetch_tracks_for_candidates(sp, candidates, max_tracks=target_size)
+
+    if not tracks:
+        logger.warning("Could not find any tracks for %s playlist", playlist_type)
+        return None
+
+    if description is None:
+        description = f"Discovered by Music Finder. {len(tracks)} tracks."
+
+    result = _create_spotify_playlist(sp, playlist_name, tracks, description)
+    if result:
+        result["playlist_type"] = playlist_type
+        _save_playlist_history(
+            result["playlist_id"], result["playlist_name"],
+            tracks, genre_cluster=playlist_type, playlist_type=playlist_type,
+        )
+    return result
+
+
+# Keep legacy builders for backwards compatibility
 
 def build_playlist(
     sp: spotipy.Spotify,
     candidates: List[Dict[str, Any]],
     playlist_size: int = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a single Spotify playlist from top candidates (Phase 3 compatibility).
-
-    Returns:
-        Dict with playlist metadata: playlist_id, playlist_url, tracks, stats
-        Returns None if playlist creation fails.
-    """
+    """Build a single Spotify playlist from top candidates (Phase 3 compatibility)."""
     if playlist_size is None:
         playlist_size = config.PLAYLIST_SIZE
 
@@ -137,11 +217,7 @@ def build_playlist(
         logger.error("No candidates to build playlist from")
         return None
 
-    logger.info("Fetching top tracks for %d candidates...",
-                min(len(candidates), playlist_size + 10))
-
     tracks = fetch_tracks_for_candidates(sp, candidates, playlist_size)
-
     if not tracks:
         logger.error("Could not find any tracks for candidates")
         return None
@@ -156,119 +232,13 @@ def build_playlist(
     return result
 
 
-def build_clustered_playlists(
-    sp: spotipy.Spotify,
-    clusters: Dict[str, List[Dict[str, Any]]],
-) -> List[Dict[str, Any]]:
-    """Build one Spotify playlist per genre cluster.
-
-    Args:
-        sp: Authenticated Spotify client
-        clusters: {family_name: [candidates]} from genre_cluster.cluster_candidates()
-
-    Returns:
-        List of playlist result dicts.
-    """
-    now = datetime.now()
-    date_str = now.strftime("%b %d")
-    results = []
-
-    # Sort clusters by size descending
-    sorted_clusters = sorted(clusters.items(), key=lambda x: -len(x[1]))
-
-    for family_name, candidates in sorted_clusters:
-        if not candidates:
-            continue
-
-        # Fetch tracks for this cluster's candidates
-        tracks = fetch_tracks_for_candidates(sp, candidates, max_tracks=len(candidates))
-        if not tracks:
-            logger.warning("No tracks found for cluster '%s'", family_name)
-            continue
-
-        # Short family name for playlist title
-        short_name = family_name.split(" / ")[0] if " / " in family_name else family_name
-        playlist_name = f"Niche Finds -- {short_name} -- {date_str}"
-
-        result = _create_spotify_playlist(
-            sp, playlist_name, tracks,
-            description=f"{family_name} discoveries. {len(tracks)} tracks by Music Finder.",
-        )
-        if result:
-            result["genre_cluster"] = family_name
-            _save_playlist_history(result["playlist_id"], result["playlist_name"],
-                                   tracks, genre_cluster=family_name)
-            results.append(result)
-
-    logger.info("Created %d genre cluster playlists", len(results))
-    return results
-
-
-def build_fresh_playlist(
-    sp: spotipy.Spotify,
-    all_tracks: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    """Build a playlist of tracks released within FRESH_RELEASE_MONTHS.
-
-    Args:
-        sp: Authenticated Spotify client
-        all_tracks: All tracks from all cluster playlists
-
-    Returns:
-        Playlist result dict, or None if fewer than 5 fresh tracks.
-    """
-    cutoff = datetime.now() - timedelta(days=config.FRESH_RELEASE_MONTHS * 30)
-    cutoff_str = cutoff.strftime("%Y-%m-%d")
-
-    fresh_tracks = []
-    for track in all_tracks:
-        rd = track.get("release_date", "")
-        if not rd:
-            continue
-        # Spotify release dates can be YYYY, YYYY-MM, or YYYY-MM-DD
-        try:
-            if len(rd) == 4:
-                rd_full = f"{rd}-01-01"
-            elif len(rd) == 7:
-                rd_full = f"{rd}-01"
-            else:
-                rd_full = rd
-            if rd_full >= cutoff_str:
-                fresh_tracks.append(track)
-        except (ValueError, TypeError):
-            continue
-
-    if len(fresh_tracks) < 5:
-        logger.info("Only %d fresh tracks (need 5+) — skipping Fresh Finds playlist",
-                     len(fresh_tracks))
-        return None
-
-    now = datetime.now()
-    playlist_name = f"Fresh Finds -- {now.strftime('%b %d, %Y')}"
-
-    result = _create_spotify_playlist(
-        sp, playlist_name, fresh_tracks,
-        description=f"New releases from the last {config.FRESH_RELEASE_MONTHS} months. "
-                    f"{len(fresh_tracks)} tracks by Music Finder.",
-    )
-    if result:
-        result["is_fresh"] = True
-        _save_playlist_history(result["playlist_id"], result["playlist_name"],
-                               fresh_tracks, genre_cluster="Fresh")
-
-    return result
-
-
 def _create_spotify_playlist(
     sp: spotipy.Spotify,
     playlist_name: str,
     tracks: List[Dict[str, Any]],
     description: str = None,
 ) -> Optional[Dict[str, Any]]:
-    """Create a Spotify playlist and add tracks using raw HTTP.
-
-    Returns playlist result dict or None on failure.
-    """
+    """Create a Spotify playlist and add tracks using raw HTTP."""
     from spotify_client import _count_request
 
     if description is None:
@@ -348,6 +318,7 @@ def _save_playlist_history(
     playlist_name: str,
     tracks: List[Dict[str, Any]],
     genre_cluster: str = None,
+    playlist_type: str = None,
 ) -> None:
     """Save playlist and track recommendations to the database."""
     conn = db.get_connection()
@@ -364,8 +335,8 @@ def _save_playlist_history(
             conn.execute(
                 """INSERT INTO recommendations
                    (artist_spotify_id, track_spotify_id, playlist_history_id,
-                    artist_name, artist_genres, release_date)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                    artist_name, artist_genres, release_date, playlist_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     track.get("artist_spotify_id"),
                     track["track_id"],
@@ -373,12 +344,13 @@ def _save_playlist_history(
                     track.get("artist_name"),
                     track.get("artist_genres"),
                     track.get("release_date"),
+                    playlist_type,
                 ),
             )
 
         conn.commit()
-        logger.info("Saved playlist history (id=%d) with %d recommendations",
-                    history_id, len(tracks))
+        logger.info("Saved playlist history (id=%d, type=%s) with %d recommendations",
+                    history_id, playlist_type, len(tracks))
     except Exception as e:
         logger.error("Failed to save playlist history: %s", e)
     finally:

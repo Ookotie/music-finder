@@ -313,6 +313,118 @@ def discover_from_blogs() -> List[Dict[str, Any]]:
         return []
 
 
+def discover_from_spotify_recommendations(
+    sp: spotipy.Spotify,
+    seed_artists: List[Dict[str, Any]],
+    genre_weights: Dict[str, float],
+    playlist_type: str = "rising_stars",
+) -> List[Dict[str, Any]]:
+    """Discover candidates via Spotify's recommendations endpoint.
+
+    1 API call returns up to 100 tracks WITH full metadata — vastly more
+    efficient than search→resolve→fetch per artist.
+
+    Args:
+        playlist_type: "rising_stars" (min_pop=30, max_pop=65) or
+                       "deep_cuts" (max_pop=30)
+    """
+    from spotify_client import get_recommendations, SpotifyRateLimitError
+
+    logger.info("Discovering from Spotify recommendations (type=%s)...", playlist_type)
+
+    # Build seeds: top 5 artists from taste profile that have Spotify IDs
+    artist_seeds = [
+        a["spotify_id"] for a in seed_artists
+        if a.get("spotify_id")
+    ][:5]
+
+    # Top genre seeds (Spotify uses specific genre names)
+    skip_tags = {"english", "british", "american", "canadian", "australian",
+                 "german", "french", "swedish", "nuno", "2010s", "2000s",
+                 "1990s", "1980s", "seen live", "favorites"}
+    genre_seeds = [
+        g for g, _ in sorted(genre_weights.items(), key=lambda x: -x[1])
+        if g.lower() not in skip_tags
+    ][:3]
+
+    # Set popularity params based on playlist type
+    rec_kwargs = {}
+    if playlist_type == "rising_stars":
+        rec_kwargs = {"min_popularity": 30, "max_popularity": 65}
+    elif playlist_type == "deep_cuts":
+        rec_kwargs = {"max_popularity": 30}
+
+    all_tracks = []
+
+    # Strategy 1: Seed with top artists
+    if artist_seeds:
+        try:
+            tracks = get_recommendations(
+                sp, seed_artists=artist_seeds, limit=100, **rec_kwargs
+            )
+            all_tracks.extend(tracks)
+        except SpotifyRateLimitError:
+            raise
+        except Exception as e:
+            logger.warning("Spotify recs (artist seeds) failed: %s", e)
+
+    # Strategy 2: Seed with genres (different results)
+    if genre_seeds:
+        try:
+            tracks = get_recommendations(
+                sp, seed_genres=genre_seeds, limit=100, **rec_kwargs
+            )
+            all_tracks.extend(tracks)
+        except SpotifyRateLimitError:
+            raise
+        except Exception as e:
+            logger.warning("Spotify recs (genre seeds) failed: %s", e)
+
+    # Convert tracks to candidate format
+    candidates = {}
+    for track in all_tracks:
+        aid = track.get("artist_spotify_id")
+        if not aid:
+            continue
+        name_key = track["artist_name"].lower().strip()
+        if name_key in ("various artists",):
+            continue
+
+        if name_key in candidates:
+            candidates[name_key]["discovery_sources"].add(f"spotify_recs:{playlist_type}")
+        else:
+            candidates[name_key] = {
+                "name": track["artist_name"],
+                "spotify_id": aid,
+                "mb_id": None,
+                "genres": [],
+                "discovery_sources": {f"spotify_recs:{playlist_type}"},
+                "mb_score": 0,
+                # Store the track directly — no separate fetch needed
+                "_rec_track": {
+                    "track_id": track["track_id"],
+                    "track_name": track["track_name"],
+                    "artist_name": track["artist_name"],
+                    "duration_ms": track.get("duration_ms", 0),
+                    "preview_url": track.get("preview_url"),
+                    "release_date": track.get("release_date", ""),
+                },
+            }
+            # Use the track's release_date for recency scoring
+            if track.get("release_date"):
+                candidates[name_key]["release_date"] = track["release_date"]
+
+    result = []
+    for c in candidates.values():
+        c["source_count"] = len(c["discovery_sources"])
+        c["discovery_sources"] = list(c["discovery_sources"])
+        result.append(c)
+
+    logger.info("  Spotify recommendations: %d unique candidates from %d tracks",
+                len(result), len(all_tracks))
+    return result
+
+
 def resolve_spotify_ids(
     sp: spotipy.Spotify,
     candidates: List[Dict[str, Any]],
@@ -440,6 +552,8 @@ def run_discovery(
                    None = use all (backwards compatible).
 
     Returns scored and ranked candidates ready for playlist building.
+    Candidates from Spotify recommendations carry their track pre-attached
+    in the `_rec_track` field (no separate track fetch needed).
     """
     # Load taste profile and seed artists from DB
     genre_weights = dict(db.get_taste_profile())
@@ -461,29 +575,45 @@ def run_discovery(
     # Gather candidates from all sources
     all_candidates = []
 
-    # Source 1: MusicBrainz tag search
+    # Source 1: MusicBrainz tag search (free, no API key)
     mb_candidates = discover_from_musicbrainz(rotated_weights, seed_ids)
     all_candidates.extend(mb_candidates)
 
-    # Source 2: Spotify search (skipped — burns API calls)
-
-    # Source 3: Last.fm (if configured)
+    # Source 2: Last.fm (if configured)
     lfm_candidates = discover_from_lastfm(rotated_weights, rotated_seeds)
     all_candidates.extend(lfm_candidates)
 
-    # Source 4: Bandcamp (no API key, no Spotify calls)
+    # Source 3: Bandcamp (no API key, no Spotify calls)
     try:
         bc_candidates = discover_from_bandcamp(rotated_weights)
         all_candidates.extend(bc_candidates)
     except Exception as e:
         logger.warning("Bandcamp source failed (non-fatal): %s", e)
 
-    # Source 5: Music blog RSS feeds (no API key, no Spotify calls)
+    # Source 4: Music blog RSS feeds (no API key, no Spotify calls)
     try:
         blog_candidates = discover_from_blogs()
         all_candidates.extend(blog_candidates)
     except Exception as e:
         logger.warning("Blog RSS source failed (non-fatal): %s", e)
+
+    # Source 5: Spotify recommendations — rising stars candidates
+    try:
+        rising_recs = discover_from_spotify_recommendations(
+            sp, seed_artists, rotated_weights, playlist_type="rising_stars"
+        )
+        all_candidates.extend(rising_recs)
+    except Exception as e:
+        logger.warning("Spotify recs (rising) failed (non-fatal): %s", e)
+
+    # Source 6: Spotify recommendations — deep cuts candidates
+    try:
+        deep_recs = discover_from_spotify_recommendations(
+            sp, seed_artists, rotated_weights, playlist_type="deep_cuts"
+        )
+        all_candidates.extend(deep_recs)
+    except Exception as e:
+        logger.warning("Spotify recs (deep) failed (non-fatal): %s", e)
 
     if not all_candidates:
         logger.error("No candidates discovered from any source")
@@ -516,14 +646,14 @@ def run_discovery(
     scored = score_candidates(candidates, genre_weights)
     logger.info("Scored %d candidates pre-Spotify resolution", len(scored))
 
-    # Resolve Spotify IDs for top candidates. 80 for 50-track playlists
-    # across multiple genre clusters, plus buffer.
-    top_n = min(len(scored), 80)
+    # Resolve Spotify IDs for top 200 candidates — batch endpoints make this
+    # affordable (4 calls for 200 artists vs 200 individual searches).
+    top_n = min(len(scored), 200)
     top_candidates = scored[:top_n]
     logger.info("Resolving Spotify IDs for top %d candidates...", top_n)
     resolved = resolve_spotify_ids(sp, top_candidates, seed_ids)
 
-    # Filter cooldown
+    # Filter cooldown (global — per-playlist cooldown applied later in scanner)
     resolved = filter_already_recommended(resolved)
 
     # Re-sort after filtering
@@ -699,6 +829,12 @@ def _merge_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 existing["lastfm_match"] = max(
                     existing.get("lastfm_match", 0), c["lastfm_match"]
                 )
+            # Keep pre-fetched track from Spotify recommendations
+            if c.get("_rec_track") and not existing.get("_rec_track"):
+                existing["_rec_track"] = c["_rec_track"]
+            # Keep release_date if available
+            if c.get("release_date") and not existing.get("release_date"):
+                existing["release_date"] = c["release_date"]
         else:
             merged[key] = c.copy()
 

@@ -1,7 +1,7 @@
 """Full pipeline runner — CLI entry point for Music Finder.
 
 Usage:
-    python run_pipeline.py               # Full pipeline: feedback → discover → cluster → playlists → notify
+    python run_pipeline.py               # Full pipeline: feedback → discover → 3 playlists → notify
     python run_pipeline.py --discover    # Discovery only (no playlist)
     python run_pipeline.py --playlist    # Playlist from existing candidates
     python run_pipeline.py --dry-run     # Discovery + scoring, skip playlist creation
@@ -17,7 +17,7 @@ import config
 import db
 import spotify_client
 from discovery import run_discovery
-from notification import format_notification, format_multi_notification
+from notification import format_notification
 from playlist_builder import build_playlist
 from scanner import run_music_scan
 
@@ -33,16 +33,16 @@ logger = logging.getLogger(__name__)
 def print_candidates(candidates, limit=30):
     """Print a formatted table of top candidates."""
     print(f"\n{'#':<4} {'ARTIST':<30} {'COMP':>6} {'GENRE':>6} "
-          f"{'POP':>5} {'SRC':>4} {'CLUSTER':<20} {'LISTENERS':>12}")
-    print("-" * 95)
+          f"{'POP':>5} {'SRC':>4} {'RECENCY':>7} {'LISTENERS':>12}")
+    print("-" * 100)
 
     for i, c in enumerate(candidates[:limit], 1):
         listeners = c.get("lastfm_listeners", 0)
         listeners_str = f"{listeners:,}" if listeners else "—"
-        cluster = c.get("genre_cluster", "—")[:18]
+        recency = c.get("recency_score", 0)
         print(f"  {i:<3} {c['name'][:28]:<30} {c['composite_score']:>5.3f}  "
               f"{c['genre_match_score']:>5.3f} {c['popularity_score']:>5.2f} "
-              f"{c.get('source_count', 1):>3}  {cluster:<20} {listeners_str:>12}")
+              f"{c.get('source_count', 1):>3}  {recency:>6.2f}  {listeners_str:>12}")
 
     if len(candidates) > limit:
         print(f"\n  ... and {len(candidates) - limit} more candidates")
@@ -54,40 +54,28 @@ def print_candidates(candidates, limit=30):
         print(f"\n  Total: {total} | Avg score: {avg_score:.3f} | Multi-source: {multi_src}")
 
 
-def print_cluster_summary(candidates):
-    """Print genre cluster breakdown."""
-    clusters = {}
-    for c in candidates:
-        cluster = c.get("genre_cluster", "Unassigned")
-        clusters.setdefault(cluster, []).append(c)
-
-    print(f"\n{'='*60}")
-    print("GENRE CLUSTERS")
-    print(f"{'='*60}")
-    for name, members in sorted(clusters.items(), key=lambda x: -len(x[1])):
-        avg = sum(m["composite_score"] for m in members) / len(members)
-        print(f"  {name:<25} {len(members):>3} candidates  avg={avg:.3f}")
-    print(f"{'='*60}")
-
-
 def print_playlists(result):
     """Print multi-playlist results."""
     print(f"\n{'='*60}")
     print("PLAYLISTS CREATED")
     print(f"{'='*60}")
 
-    for p in result.get("playlists", []):
-        print(f"\n  {p.get('genre_cluster', p['name'])}")
-        print(f"    Name:   {p['name']}")
-        print(f"    URL:    {p['url']}")
-        print(f"    Tracks: {p['track_count']}")
+    playlists = result.get("playlists", {})
 
-    fp = result.get("fresh_playlist")
-    if fp:
-        print(f"\n  Fresh Finds")
-        print(f"    Name:   {fp['name']}")
-        print(f"    URL:    {fp['url']}")
-        print(f"    Tracks: {fp['track_count']}")
+    for ptype, label in [
+        ("rising_stars", "Rising Stars"),
+        ("deep_cuts", "Deep Cuts"),
+        ("genre_spotlight", "Genre Spotlight"),
+    ]:
+        p = playlists.get(ptype)
+        if p:
+            genre_info = f" [{p['genre']}]" if p.get("genre") else ""
+            print(f"\n  {label}{genre_info}")
+            print(f"    Name:   {p['name']}")
+            print(f"    URL:    {p['url']}")
+            print(f"    Tracks: {p['track_count']}")
+        else:
+            print(f"\n  {label}: not created")
 
     print(f"{'='*60}")
 
@@ -100,41 +88,46 @@ def run_full():
     print("SCAN RESULTS")
     print(f"{'='*60}")
     print(f"  Candidates discovered: {result['candidates_discovered']}")
-    print(f"  Candidates scored:     {result['candidates_scored']}")
 
     if result.get("feedback_summary"):
         fb = result["feedback_summary"]
         print(f"  Feedback: {fb['total_saved']} saved, {fb['total_not_saved']} not saved "
               f"(save rate: {fb['save_rate']:.0%})")
 
-    if result["playlists"]:
-        for p in result["playlists"]:
-            print(f"  Playlist: {p['name']} ({p['track_count']} tracks)")
+    playlists = result.get("playlists", {})
+    total_tracks = 0
+    for ptype, label in [
+        ("rising_stars", "Rising Stars"),
+        ("deep_cuts", "Deep Cuts"),
+        ("genre_spotlight", "Genre Spotlight"),
+    ]:
+        p = playlists.get(ptype)
+        if p:
+            genre_info = f" [{p.get('genre', '')}]" if p.get("genre") else ""
+            print(f"  {label}{genre_info}: {p['track_count']} tracks")
             print(f"    URL: {p['url']}")
-    else:
-        print("  Playlists: none created")
+            total_tracks += p["track_count"]
+        else:
+            print(f"  {label}: not created")
 
-    if result.get("fresh_playlist"):
-        fp = result["fresh_playlist"]
-        print(f"  Fresh Finds: {fp['name']} ({fp['track_count']} tracks)")
-        print(f"    URL: {fp['url']}")
+    print(f"  Total tracks: {total_tracks}")
 
     if result["errors"]:
         print(f"  Errors:")
         for e in result["errors"]:
             print(f"    - {e}")
     print(f"  Duration: {result['duration_sec']}s")
+    print(f"  Spotify API calls: {spotify_client.get_request_count()}")
 
     if result["notification_text"]:
         print(f"\n--- Telegram Notification ---")
-        # Handle non-ASCII artist names on Windows console (cp1252)
         try:
             print(result["notification_text"])
         except UnicodeEncodeError:
             print(result["notification_text"].encode("utf-8", errors="replace").decode("utf-8"))
         print(f"--- End ---")
 
-    return 0 if result.get("playlists") else 1
+    return 0 if total_tracks > 0 else 1
 
 
 def run_discover_only():
@@ -163,6 +156,7 @@ def run_discover_only():
     print(f"{'='*60}")
     print_candidates(candidates)
     print(f"\n  Saved {len(candidates)} candidates to DB")
+    print(f"  Spotify API calls: {spotify_client.get_request_count()}")
     return 0
 
 
@@ -207,7 +201,10 @@ def run_playlist_only():
 
 
 def run_dry():
-    """Discovery + scoring without Spotify ID resolution or playlist."""
+    """Discovery + scoring without Spotify ID resolution or playlist.
+
+    Shows how candidates would be scored under each profile.
+    """
     import lastfm_client
     import musicbrainz_client
     from discovery import (
@@ -215,7 +212,6 @@ def run_dry():
         _merge_candidates, _filter_mainstream,
     )
     from scorer import score_candidates
-    from genre_cluster import cluster_candidates
 
     profile = dict(db.get_taste_profile())
     if not profile:
@@ -230,7 +226,6 @@ def run_dry():
     mb_candidates = discover_from_musicbrainz(profile, seed_ids)
     lfm_candidates = discover_from_lastfm(profile, seed_artists)
     all_candidates = mb_candidates + lfm_candidates
-
     candidates = _merge_candidates(all_candidates)
     candidates = [c for c in candidates if c["name"].lower().strip() not in seed_names]
     candidates = _filter_mainstream(candidates)
@@ -240,16 +235,21 @@ def run_dry():
     needs_genres = [c for c in candidates if not c.get("genres")]
     if needs_genres:
         musicbrainz_client.enrich_artists_with_genres(candidates[:200], "dry-run")
-    scored = score_candidates(candidates, profile)
-
-    # Cluster
-    clusters = cluster_candidates(scored, profile)
 
     print(f"\n{'='*60}")
-    print("DRY RUN — Discovery + Scoring + Clustering (no Spotify)")
+    print("DRY RUN — Discovery + Multi-Profile Scoring (no Spotify)")
     print(f"{'='*60}")
-    print_candidates(scored, limit=40)
-    print_cluster_summary(scored)
+    print(f"  Total candidates discovered: {len(candidates)}")
+
+    for scoring_profile, label in [
+        ("rising_stars", "RISING STARS"),
+        ("deep_cuts", "DEEP CUTS"),
+        ("default", "DEFAULT"),
+    ]:
+        scored = score_candidates([c.copy() for c in candidates], profile, profile=scoring_profile)
+        print(f"\n--- {label} (profile={scoring_profile}) ---")
+        print_candidates(scored, limit=20)
+
     return 0
 
 

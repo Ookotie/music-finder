@@ -169,6 +169,63 @@ def cluster_candidates(
     return dict(clusters)
 
 
+def get_next_spotlight_genre(genre_weights: Dict[str, float] = None) -> str:
+    """Get the next genre family for the Genre Spotlight playlist.
+
+    Cycles through the user's top genre families, skipping the most recently used.
+    Tracks history in the spotlight_history DB table.
+    """
+    import db as _db
+
+    # Get user's top genre families ranked by taste profile weight
+    ranked_families = _rank_families_by_taste(genre_weights) if genre_weights else list(GENRE_FAMILIES.keys())
+
+    # Get recently used spotlight genres
+    recent = _db.get_spotlight_history(limit=len(ranked_families))
+
+    # Pick the highest-ranked family not recently used
+    for family in ranked_families:
+        if family not in recent:
+            _db.save_spotlight_genre(family)
+            return family
+
+    # All have been used recently — pick the least recent one
+    # (the one at the end of the history list, i.e., used longest ago)
+    if recent:
+        least_recent = recent[-1]
+        _db.save_spotlight_genre(least_recent)
+        return least_recent
+
+    # Fallback
+    fallback = ranked_families[0] if ranked_families else list(GENRE_FAMILIES.keys())[0]
+    _db.save_spotlight_genre(fallback)
+    return fallback
+
+
+def _rank_families_by_taste(genre_weights: Dict[str, float]) -> List[str]:
+    """Rank genre families by their total weight in the taste profile."""
+    family_scores = {}
+    for family_name, keywords in GENRE_FAMILIES.items():
+        score = 0.0
+        for genre, weight in genre_weights.items():
+            g = genre.lower().strip()
+            if g in keywords:
+                score += weight
+            else:
+                for kw in keywords:
+                    if kw in g or g in kw:
+                        score += weight * 0.5
+                        break
+        family_scores[family_name] = score
+
+    return sorted(family_scores, key=family_scores.get, reverse=True)
+
+
+def get_spotlight_keywords(genre_family: str) -> set:
+    """Get the keyword set for a genre family. Used for filtering candidates."""
+    return GENRE_FAMILIES.get(genre_family, set())
+
+
 def _find_nearest_cluster(
     orphans: List[Dict[str, Any]],
     large_clusters: Dict[str, List[Dict[str, Any]]],

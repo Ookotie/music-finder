@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _request_count = 0
 _SEARCH_DELAY = 0.15  # seconds between search-type calls
 _MAX_REQUESTS_PER_SESSION = int(
-    getattr(config, "SPOTIFY_MAX_REQUESTS", 200)
+    getattr(config, "SPOTIFY_MAX_REQUESTS", 350)
 )
 
 
@@ -206,3 +206,84 @@ def enrich_artists(
             artist.update(enriched_map[aid])
 
     return artists
+
+
+def get_recommendations(
+    sp: spotipy.Spotify,
+    seed_artists: List[str] = None,
+    seed_genres: List[str] = None,
+    seed_tracks: List[str] = None,
+    limit: int = 100,
+    **kwargs,
+) -> List[Dict[str, Any]]:
+    """Get track recommendations from Spotify's recommendations endpoint.
+
+    Returns up to `limit` tracks with full metadata (track ID, artist, popularity,
+    release date). This is vastly more efficient than search→resolve→fetch per artist.
+
+    kwargs can include: min_popularity, max_popularity, target_popularity, etc.
+
+    Returns list of track dicts with artist info embedded.
+    """
+    _count_request("api")
+
+    seeds = {}
+    if seed_artists:
+        seeds["seed_artists"] = seed_artists[:5]  # max 5 seeds total
+    if seed_genres:
+        seeds["seed_genres"] = seed_genres[:5]
+    if seed_tracks:
+        seeds["seed_tracks"] = seed_tracks[:5]
+
+    if not seeds:
+        return []
+
+    try:
+        result = sp.recommendations(limit=limit, **seeds, **kwargs)
+        tracks = []
+        for item in result.get("tracks", []):
+            album = item.get("album", {})
+            artist = item["artists"][0] if item.get("artists") else {}
+            tracks.append({
+                "track_id": item["id"],
+                "track_name": item["name"],
+                "artist_name": artist.get("name", "Unknown"),
+                "artist_spotify_id": artist.get("id"),
+                "duration_ms": item.get("duration_ms", 0),
+                "preview_url": item.get("preview_url"),
+                "release_date": album.get("release_date", ""),
+                "popularity": item.get("popularity", 0),
+                "album_name": album.get("name", ""),
+            })
+        logger.info("Spotify recommendations returned %d tracks", len(tracks))
+        return tracks
+    except Exception as e:
+        logger.warning("Spotify recommendations failed: %s", e)
+        return []
+
+
+def get_artists_batch(
+    sp: spotipy.Spotify, artist_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Batch-fetch artist objects. Returns {artist_id: artist_dict}.
+
+    Uses sp.artists() which fetches up to 50 per call.
+    """
+    result = {}
+    for i in range(0, len(artist_ids), 50):
+        batch = artist_ids[i:i + 50]
+        try:
+            _count_request("api")
+            response = sp.artists(batch)
+            for item in response.get("artists", []):
+                if item:
+                    result[item["id"]] = {
+                        "spotify_id": item["id"],
+                        "name": item["name"],
+                        "genres": item.get("genres", []),
+                        "popularity": item.get("popularity", 0),
+                        "followers": item.get("followers", {}).get("total", 0),
+                    }
+        except Exception as e:
+            logger.warning("Batch artist fetch failed for batch %d: %s", i // 50, e)
+    return result

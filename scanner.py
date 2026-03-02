@@ -1,13 +1,12 @@
 """Scanner — Full pipeline orchestrator for Music Finder.
 
-Phase 5 pipeline:
-  0. Check feedback from previous playlists (auto-learn)
-  1. Authenticate Spotify
-  2. Discover candidates (MusicBrainz + Last.fm, rotated by run_index)
-  3. Score and rank (with momentum + feedback boost)
-  4. Cluster by genre family
-  5. Build genre-separated playlists + fresh finds
-  6. Format and send Telegram notification
+Multi-playlist pipeline:
+  0. Authenticate Spotify + check feedback
+  1. Discover candidates (all sources including Spotify recommendations)
+  2. Score candidates 3x with different profiles (Rising Stars, Deep Cuts, Genre Spotlight)
+  3. Apply per-playlist cooldowns
+  4. Build 3 playlists
+  5. Send Telegram notification
 
 Handles partial source failure, rate limits, and low-candidate fallback.
 Returns structured result dict for status reporting.
@@ -16,6 +15,7 @@ Returns structured result dict for status reporting.
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import config
@@ -23,12 +23,10 @@ import db
 import spotify_client as sp_client
 from discovery import run_discovery
 from feedback import check_feedback, apply_feedback_to_taste_profile, get_feedback_summary
-from genre_cluster import cluster_candidates
-from notification import format_multi_notification, format_error_notification
-from playlist_builder import (
-    build_clustered_playlists, build_fresh_playlist,
-    fetch_tracks_for_candidates, build_playlist,
-)
+from genre_cluster import get_next_spotlight_genre, get_spotlight_keywords
+from notification import format_scan_notification, format_error_notification
+from playlist_builder import build_playlist_from_profile
+from scorer import score_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +65,8 @@ def _try_send_telegram(message: str) -> bool:
 def run_music_scan(run_index: int = None) -> Dict[str, Any]:
     """Run the full music discovery pipeline.
 
+    Produces 3 playlists: Rising Stars, Deep Cuts, Genre Spotlight.
+
     Args:
         run_index: 0 (Sun), 1 (Tue), 2 (Thu) — controls seed/genre rotation.
                    None = auto-detect from day of week, or use all.
@@ -74,9 +74,11 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
     Returns:
         {
             "candidates_discovered": int,
-            "candidates_scored": int,
-            "playlists": [{"id", "name", "url", "track_count", "genre_cluster"}, ...],
-            "fresh_playlist": {"id", "name", "url", "track_count"} | None,
+            "playlists": {
+                "rising_stars": {"id", "name", "url", "track_count"} | None,
+                "deep_cuts": {"id", "name", "url", "track_count"} | None,
+                "genre_spotlight": {"id", "name", "url", "track_count", "genre"} | None,
+            },
             "feedback_summary": {...} | None,
             "notification_sent": bool,
             "notification_text": str,
@@ -89,19 +91,19 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
 
     # Auto-detect run_index from day of week
     if run_index is None:
-        from datetime import datetime
         weekday = datetime.now().weekday()
         run_index = _DAY_TO_INDEX.get(weekday)
-        # If run on a non-scheduled day (e.g., manual run), use None (all seeds)
 
     # Reset Spotify request counter for this run
     sp_client.reset_request_count()
 
     result = {
         "candidates_discovered": 0,
-        "candidates_scored": 0,
-        "playlists": [],
-        "fresh_playlist": None,
+        "playlists": {
+            "rising_stars": None,
+            "deep_cuts": None,
+            "genre_spotlight": None,
+        },
         "feedback_summary": None,
         "notification_sent": False,
         "notification_text": "",
@@ -119,6 +121,7 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
         return result
 
     logger.info("Loaded taste profile: %d genres", len(profile))
+    genre_weights = dict(profile)
 
     # Step 1: Authenticate Spotify
     try:
@@ -138,16 +141,16 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
 
     # Step 2: Check feedback from previous playlists
     feedback_result = None
-    feedback_adjustments = None
     try:
         feedback_result = check_feedback(sp)
         if feedback_result["checked_count"] > 0:
-            feedback_adjustments = apply_feedback_to_taste_profile(feedback_result)
+            apply_feedback_to_taste_profile(feedback_result)
             logger.info("Feedback check: %d saved, %d not saved",
                         len(feedback_result["saved"]),
                         len(feedback_result["not_saved"]))
             # Reload taste profile after adjustments
             profile = db.get_taste_profile()
+            genre_weights = dict(profile)
         result["feedback_summary"] = get_feedback_summary()
     except Exception as e:
         logger.warning("Feedback check failed (non-fatal): %s", e)
@@ -158,7 +161,7 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
     if result.get("feedback_summary") and result["feedback_summary"].get("top_liked_genres"):
         liked_genres = dict(result["feedback_summary"]["top_liked_genres"])
 
-    # Step 3: Run discovery
+    # Step 3: Run discovery (all sources)
     try:
         candidates = run_discovery(sp, run_index=run_index)
         result["candidates_discovered"] = len(candidates)
@@ -187,111 +190,166 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
             if c.get("spotify_id") and c.get("lastfm_listeners")
         ]
         if snapshots:
-            # Enrich with previous snapshots for momentum scoring
             artist_ids = [s[0] for s in snapshots]
             prev_snapshots = db.get_listener_snapshots(artist_ids)
             for c in candidates:
                 sid = c.get("spotify_id")
                 if sid and sid in prev_snapshots:
                     c["previous_listeners"] = prev_snapshots[sid]
-
             db.save_listener_snapshots(snapshots)
     except Exception as e:
         logger.warning("Listener snapshot save failed (non-fatal): %s", e)
 
-    # Step 5: Re-score with momentum data and feedback boost
-    try:
-        from scorer import score_candidates
-        genre_weights = dict(profile)
-        candidates = score_candidates(candidates, genre_weights, liked_genres)
-        result["candidates_scored"] = len(candidates)
-    except Exception as e:
-        logger.warning("Re-scoring failed (using existing scores): %s", e)
-        result["candidates_scored"] = len(candidates)
-
-    # Save candidates to DB
+    # Save all candidates to DB
     try:
         db.save_candidates(candidates)
-        logger.info("Saved %d candidates to database", len(candidates))
     except Exception as e:
-        msg = f"Failed to save candidates: {e}"
-        logger.error(msg)
-        errors.append(msg)
-        _try_track_error(e, "music.db_save")
+        logger.warning("Failed to save candidates: %s", e)
 
-    # Step 6: Cluster candidates by genre family
-    genre_weights = dict(profile)
-    clusters = cluster_candidates(candidates, genre_weights)
-    logger.info("Clustered into %d genre families", len(clusters))
+    # Step 5: Score candidates 3x with different profiles
+    now = datetime.now()
+    date_str = now.strftime("%b %d, %Y")
 
-    # Step 7: Fetch tracks for all candidates (shared across playlists)
-    all_tracks = fetch_tracks_for_candidates(sp, candidates, max_tracks=config.PLAYLIST_SIZE)
+    # Get per-playlist cooldown sets
+    cooldown_weeks = config.ARTIST_COOLDOWN_WEEKS
+    rising_cooldown = db.get_recently_recommended(cooldown_weeks, "rising_stars")
+    deep_cooldown = db.get_recently_recommended(cooldown_weeks, "deep_cuts")
+    spotlight_cooldown = db.get_recently_recommended(cooldown_weeks, "genre_spotlight")
 
-    if not all_tracks:
-        errors.append("Could not find any tracks for candidates")
-        result["duration_sec"] = round(time.time() - start_time, 1)
-        notif = format_error_notification(errors)
-        result["notification_text"] = notif
-        result["notification_sent"] = _try_send_telegram(notif)
-        return result
-
-    # Group tracks by their cluster assignment
-    track_clusters: Dict[str, List] = {}
-    for track in all_tracks:
-        cluster_name = track.get("genre_cluster", "Mixed")
-        track_clusters.setdefault(cluster_name, []).append(track)
-
-    # Step 8: Build genre cluster playlists
-    playlist_results = []
+    # --- Rising Stars ---
     try:
-        # Build a candidates-by-cluster dict for build_clustered_playlists
-        # We need to pass candidates (not tracks) to the builder,
-        # but only those that already have tracks fetched
-        tracks_by_artist = {t["artist_spotify_id"]: t for t in all_tracks}
-        cluster_candidates_with_tracks = {}
-        for cluster_name, cluster_cands in clusters.items():
-            with_tracks = [
-                c for c in cluster_cands
-                if c.get("spotify_id") in tracks_by_artist
-            ]
-            if with_tracks:
-                cluster_candidates_with_tracks[cluster_name] = with_tracks
+        rising_scored = score_candidates(
+            [c.copy() for c in candidates], genre_weights, liked_genres,
+            profile="rising_stars",
+        )
+        # Apply per-playlist cooldown
+        rising_scored = [c for c in rising_scored
+                         if c.get("spotify_id") not in rising_cooldown]
+        logger.info("Rising Stars: %d candidates after scoring + cooldown", len(rising_scored))
 
-        playlist_results = build_clustered_playlists(sp, cluster_candidates_with_tracks)
-        for pr in playlist_results:
-            result["playlists"].append({
-                "id": pr["playlist_id"],
-                "name": pr["playlist_name"],
-                "url": pr["playlist_url"],
-                "track_count": pr["stats"]["track_count"],
-                "genre_cluster": pr.get("genre_cluster", ""),
-            })
-    except Exception as e:
-        msg = f"Cluster playlist build failed: {e}"
-        logger.error(msg)
-        errors.append(msg)
-        _try_track_error(e, "music.playlist_clusters")
-
-    # Step 9: Build fresh finds playlist
-    try:
-        fresh_result = build_fresh_playlist(sp, all_tracks)
-        if fresh_result:
-            result["fresh_playlist"] = {
-                "id": fresh_result["playlist_id"],
-                "name": fresh_result["playlist_name"],
-                "url": fresh_result["playlist_url"],
-                "track_count": fresh_result["stats"]["track_count"],
+        rising_result = build_playlist_from_profile(
+            sp, rising_scored, "rising_stars",
+            target_size=config.RISING_STARS_SIZE,
+            playlist_name=f"Rising Stars -- {date_str}",
+            description="New & trending artists matching your taste. Discovered by Music Finder.",
+        )
+        if rising_result:
+            result["playlists"]["rising_stars"] = {
+                "id": rising_result["playlist_id"],
+                "name": rising_result["playlist_name"],
+                "url": rising_result["playlist_url"],
+                "track_count": rising_result["stats"]["track_count"],
+                "tracks": rising_result.get("tracks", []),
             }
     except Exception as e:
-        logger.warning("Fresh finds playlist failed (non-fatal): %s", e)
-        _try_track_error(e, "music.playlist_fresh")
+        msg = f"Rising Stars playlist failed: {e}"
+        logger.error(msg)
+        errors.append(msg)
+        _try_track_error(e, "music.playlist_rising")
 
-    # Step 10: Send notification
-    if playlist_results:
-        notif = format_multi_notification(
-            playlist_results=playlist_results,
-            fresh_result=fresh_result if result.get("fresh_playlist") else None,
-            candidates=candidates,
+    # --- Deep Cuts ---
+    try:
+        deep_scored = score_candidates(
+            [c.copy() for c in candidates], genre_weights, liked_genres,
+            profile="deep_cuts",
+        )
+        deep_scored = [c for c in deep_scored
+                       if c.get("spotify_id") not in deep_cooldown]
+        logger.info("Deep Cuts: %d candidates after scoring + cooldown", len(deep_scored))
+
+        deep_result = build_playlist_from_profile(
+            sp, deep_scored, "deep_cuts",
+            target_size=config.DEEP_CUTS_SIZE,
+            playlist_name=f"Deep Cuts -- {date_str}",
+            description="Underground gems from your genre map. Discovered by Music Finder.",
+        )
+        if deep_result:
+            result["playlists"]["deep_cuts"] = {
+                "id": deep_result["playlist_id"],
+                "name": deep_result["playlist_name"],
+                "url": deep_result["playlist_url"],
+                "track_count": deep_result["stats"]["track_count"],
+                "tracks": deep_result.get("tracks", []),
+            }
+    except Exception as e:
+        msg = f"Deep Cuts playlist failed: {e}"
+        logger.error(msg)
+        errors.append(msg)
+        _try_track_error(e, "music.playlist_deep")
+
+    # --- Genre Spotlight ---
+    try:
+        spotlight_genre = get_next_spotlight_genre(genre_weights)
+        spotlight_keywords = get_spotlight_keywords(spotlight_genre)
+        logger.info("Genre Spotlight: %s", spotlight_genre)
+
+        # Filter candidates to those matching the spotlight genre family
+        spotlight_candidates = []
+        for c in candidates:
+            c_copy = c.copy()
+            candidate_genres = c_copy.get("genres", [])
+            if isinstance(candidate_genres, str):
+                try:
+                    candidate_genres = json.loads(candidate_genres)
+                except (json.JSONDecodeError, TypeError):
+                    candidate_genres = []
+
+            # Check if candidate matches the spotlight genre
+            candidate_genres_lower = {g.lower().strip() for g in candidate_genres}
+            match = False
+            for cg in candidate_genres_lower:
+                if cg in spotlight_keywords:
+                    match = True
+                    break
+                for kw in spotlight_keywords:
+                    if kw in cg or cg in kw:
+                        match = True
+                        break
+                if match:
+                    break
+            if match:
+                spotlight_candidates.append(c_copy)
+
+        spotlight_scored = score_candidates(
+            spotlight_candidates, genre_weights, liked_genres,
+            profile="genre_spotlight",
+        )
+        spotlight_scored = [c for c in spotlight_scored
+                           if c.get("spotify_id") not in spotlight_cooldown]
+        logger.info("Genre Spotlight (%s): %d candidates after scoring + cooldown",
+                    spotlight_genre, len(spotlight_scored))
+
+        # Short genre name for playlist title
+        short_genre = spotlight_genre.split(" / ")[0] if " / " in spotlight_genre else spotlight_genre
+        spotlight_result = build_playlist_from_profile(
+            sp, spotlight_scored, "genre_spotlight",
+            target_size=config.GENRE_SPOTLIGHT_SIZE,
+            playlist_name=f"Genre Spotlight: {short_genre} -- {date_str}",
+            description=f"Deep dive into {spotlight_genre}. Discovered by Music Finder.",
+        )
+        if spotlight_result:
+            result["playlists"]["genre_spotlight"] = {
+                "id": spotlight_result["playlist_id"],
+                "name": spotlight_result["playlist_name"],
+                "url": spotlight_result["playlist_url"],
+                "track_count": spotlight_result["stats"]["track_count"],
+                "genre": spotlight_genre,
+                "tracks": spotlight_result.get("tracks", []),
+            }
+    except Exception as e:
+        msg = f"Genre Spotlight playlist failed: {e}"
+        logger.error(msg)
+        errors.append(msg)
+        _try_track_error(e, "music.playlist_spotlight")
+
+    # Step 6: Send notification
+    playlists = result["playlists"]
+    any_created = any(v is not None for v in playlists.values())
+
+    if any_created:
+        notif = format_scan_notification(
+            playlists=playlists,
+            candidates_count=len(candidates),
             feedback_summary=result.get("feedback_summary"),
             feedback_result=feedback_result,
         )
@@ -302,11 +360,11 @@ def run_music_scan(run_index: int = None) -> Dict[str, Any]:
     result["notification_sent"] = _try_send_telegram(notif)
     result["duration_sec"] = round(time.time() - start_time, 1)
 
-    logger.info("Music scan complete in %.1fs. Playlists: %d, Fresh: %s, Errors: %d, Spotify calls: %d",
-                result["duration_sec"],
-                len(result["playlists"]),
-                "yes" if result.get("fresh_playlist") else "no",
-                len(errors),
-                sp_client.get_request_count())
+    playlist_count = sum(1 for v in playlists.values() if v is not None)
+    logger.info(
+        "Music scan complete in %.1fs. Playlists: %d/3, Errors: %d, Spotify calls: %d",
+        result["duration_sec"], playlist_count, len(errors),
+        sp_client.get_request_count(),
+    )
 
     return result

@@ -25,10 +25,18 @@ MUSIC_SCAN_HOUR = int(os.getenv("MUSIC_SCAN_HOUR", "21"))
 # Tunable defaults
 MAX_MONTHLY_LISTENERS = int(os.getenv("MAX_MONTHLY_LISTENERS", "100000"))
 PLAYLIST_SIZE = int(os.getenv("PLAYLIST_SIZE", "50"))
-ARTIST_COOLDOWN_WEEKS = int(os.getenv("ARTIST_COOLDOWN_WEEKS", "4"))
-SPOTIFY_MAX_REQUESTS = int(os.getenv("SPOTIFY_MAX_REQUESTS", "200"))
+ARTIST_COOLDOWN_WEEKS = int(os.getenv("ARTIST_COOLDOWN_WEEKS", "3"))
+SPOTIFY_MAX_REQUESTS = int(os.getenv("SPOTIFY_MAX_REQUESTS", "350"))
 
-# Fresh releases
+# Per-playlist target sizes
+RISING_STARS_SIZE = int(os.getenv("RISING_STARS_SIZE", "30"))
+DEEP_CUTS_SIZE = int(os.getenv("DEEP_CUTS_SIZE", "30"))
+GENRE_SPOTLIGHT_SIZE = int(os.getenv("GENRE_SPOTLIGHT_SIZE", "20"))
+
+# Rising Stars: only recent releases
+RISING_STARS_MAX_AGE_MONTHS = int(os.getenv("RISING_STARS_MAX_AGE_MONTHS", "12"))
+
+# Fresh releases (legacy, kept for backwards compat)
 FRESH_RELEASE_MONTHS = int(os.getenv("FRESH_RELEASE_MONTHS", "6"))
 
 # Feedback system

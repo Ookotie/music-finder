@@ -36,10 +36,14 @@ def _run_scan_job(run_index: int = None) -> None:
         from scanner import run_music_scan
         result = run_music_scan(run_index=run_index)
 
-        if result.get("playlists"):
-            total_tracks = sum(p["track_count"] for p in result["playlists"])
+        playlists = result.get("playlists", {})
+        playlist_count = sum(1 for v in playlists.values() if v is not None)
+        total_tracks = sum(
+            p.get("track_count", 0) for p in playlists.values() if p is not None
+        )
+        if playlist_count > 0:
             logger.info("Scheduled scan complete: %d playlists, %d total tracks (%.1fs)",
-                        len(result["playlists"]), total_tracks, result["duration_sec"])
+                        playlist_count, total_tracks, result["duration_sec"])
         else:
             logger.warning("Scheduled scan complete but no playlists created. Errors: %s",
                            result.get("errors", []))
@@ -114,17 +118,20 @@ if __name__ == "__main__":
 
     print(f"\n{'='*60}")
     print(f"Candidates discovered: {result['candidates_discovered']}")
-    print(f"Candidates scored:     {result['candidates_scored']}")
-    if result["playlists"]:
-        for p in result["playlists"]:
-            print(f"Playlist: {p['name']} ({p['track_count']} tracks)")
+
+    playlists = result.get("playlists", {})
+    for ptype, label in [
+        ("rising_stars", "Rising Stars"),
+        ("deep_cuts", "Deep Cuts"),
+        ("genre_spotlight", "Genre Spotlight"),
+    ]:
+        p = playlists.get(ptype)
+        if p:
+            print(f"{label}: {p['name']} ({p['track_count']} tracks)")
             print(f"  URL: {p['url']}")
-    else:
-        print("Playlists: none created")
-    if result.get("fresh_playlist"):
-        fp = result["fresh_playlist"]
-        print(f"Fresh Finds: {fp['name']} ({fp['track_count']} tracks)")
-        print(f"  URL: {fp['url']}")
+        else:
+            print(f"{label}: not created")
+
     if result["errors"]:
         print(f"Errors: {result['errors']}")
     print(f"Duration: {result['duration_sec']}s")

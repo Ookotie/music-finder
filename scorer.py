@@ -1,41 +1,96 @@
 """Scoring Algorithm — Ranks discovery candidates by fit with user's taste.
 
-composite_score = (
-    genre_match_score * 0.4      # overlap with weighted genre map
-  + popularity_score * 0.3       # favors "breakout zone" (niche/emerging)
-  + source_diversity_bonus * 0.2 # found via multiple sources = higher confidence
-  + momentum_score * 0.1         # Phase 5: listener growth tracking
-)
+Supports per-playlist scoring profiles:
+  - Rising Stars: momentum + recency heavy, relaxed genre threshold
+  - Deep Cuts: genre match + obscurity heavy, no release age limit
+  - Genre Spotlight: genre match dominant, must match spotlight genre
+  - default: original balanced weights (backwards compatible)
 """
 
 import logging
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# Scoring weights
-WEIGHT_GENRE = 0.4
-WEIGHT_POPULARITY = 0.3
-WEIGHT_SOURCE_DIVERSITY = 0.2
-WEIGHT_MOMENTUM = 0.1
+# --- Scoring Profiles ---
 
-# Minimum genre match to keep a candidate
-MIN_GENRE_MATCH = 0.3
+SCORING_PROFILES = {
+    "rising_stars": {
+        "weights": {
+            "genre": 0.25,
+            "momentum": 0.30,
+            "recency": 0.25,
+            "source_diversity": 0.10,
+            "popularity": 0.10,
+        },
+        "min_genre_match": 0.15,
+        "listener_range": (100_000, 2_000_000),  # Last.fm unique listeners
+        "max_release_age_months": 12,
+        "invert_popularity": False,  # prefer breakout zone
+    },
+    "deep_cuts": {
+        "weights": {
+            "genre": 0.50,
+            "popularity": 0.25,  # inverted — more obscure = better
+            "source_diversity": 0.15,
+            "momentum": 0.10,
+            "recency": 0.0,
+        },
+        "min_genre_match": 0.20,
+        "listener_range": (10_000, 500_000),
+        "max_release_age_months": None,  # no limit
+        "invert_popularity": True,
+    },
+    "genre_spotlight": {
+        "weights": {
+            "genre": 0.60,
+            "popularity": 0.20,
+            "source_diversity": 0.10,
+            "momentum": 0.10,
+            "recency": 0.0,
+        },
+        "min_genre_match": 0.25,
+        "listener_range": (0, 2_000_000),
+        "max_release_age_months": None,
+        "invert_popularity": False,
+    },
+    "default": {
+        "weights": {
+            "genre": 0.4,
+            "popularity": 0.3,
+            "source_diversity": 0.2,
+            "momentum": 0.1,
+            "recency": 0.0,
+        },
+        "min_genre_match": 0.3,
+        "listener_range": None,  # no filtering
+        "max_release_age_months": None,
+        "invert_popularity": False,
+    },
+}
 
 # Last.fm listener tiers for popularity scoring.
-# Last.fm "listeners" = total unique listeners (not monthly), so thresholds
-# are higher than Spotify monthly listeners. A niche artist with 50K Spotify
-# monthly might have 200-500K Last.fm unique listeners.
 LASTFM_TIERS = [
     # (max_listeners, score, label)
     (50_000, 0.6, "underground"),
     (200_000, 0.9, "growing indie"),
-    (750_000, 1.0, "breakout zone"),      # sweet spot
+    (750_000, 1.0, "breakout zone"),
     (2_000_000, 0.5, "mid-tier"),
     (5_000_000, 0.2, "popular"),
-    (float("inf"), 0.05, "mainstream"),    # heavily penalize household names
+    (float("inf"), 0.05, "mainstream"),
+]
+
+# Inverted tiers: more underground = higher score
+LASTFM_TIERS_INVERTED = [
+    (10_000, 0.7, "very underground"),
+    (50_000, 1.0, "underground sweet spot"),
+    (200_000, 0.9, "growing indie"),
+    (500_000, 0.6, "breakout"),
+    (2_000_000, 0.3, "mid-tier"),
+    (float("inf"), 0.1, "mainstream"),
 ]
 
 
@@ -43,23 +98,16 @@ def compute_genre_match(
     candidate_genres: List[str],
     genre_weights: Dict[str, float],
 ) -> float:
-    """Score 0-1 based on overlap between candidate's genres and taste profile.
-
-    Uses the taste profile weights — a match on a high-weight genre scores
-    more than a match on a low-weight genre. Includes partial matching
-    for sub-genre relationships (e.g., "electro house" partially matches "house").
-    """
+    """Score 0-1 based on overlap between candidate's genres and taste profile."""
     if not candidate_genres or not genre_weights:
         return 0.0
 
     matched_weight = 0.0
     for genre in candidate_genres:
         g = genre.lower().strip()
-        # Exact match
         if g in genre_weights:
             matched_weight += genre_weights[g]
             continue
-        # Partial match: check if any taste genre is a substring or vice versa
         best_partial = 0.0
         for taste_genre, weight in genre_weights.items():
             if g in taste_genre or taste_genre in g:
@@ -69,8 +117,6 @@ def compute_genre_match(
     if not matched_weight:
         return 0.0
 
-    # Normalize by the number of matched genres (not total genres).
-    # This avoids penalizing artists who have many non-music tags.
     match_count = sum(
         1 for g in candidate_genres
         if g.lower().strip() in genre_weights
@@ -79,59 +125,48 @@ def compute_genre_match(
     )
     match_count = max(match_count, 1)
 
-    # Scale: average weight of matched genres, boosted by having more matches
     avg_matched = matched_weight / match_count
-    breadth_bonus = min(match_count / 5.0, 1.0)  # bonus for matching multiple genres
+    breadth_bonus = min(match_count / 5.0, 1.0)
     score = avg_matched * 0.6 + breadth_bonus * 0.4
 
     return min(score, 1.0)
 
 
-def compute_popularity_score(candidate: Dict[str, Any]) -> float:
-    """Score 0-1 based on popularity, favoring niche/emerging artists.
+def compute_popularity_score(
+    candidate: Dict[str, Any], invert: bool = False
+) -> float:
+    """Score 0-1 based on popularity.
 
-    Priority order for data sources:
-    1. Last.fm listeners (real data, best signal)
-    2. MB score fallback (inverted — high relevance = more mainstream = lower score)
-
-    The goal is to find artists in the "breakout zone" — popular enough to have
-    good music on Spotify, but not yet mainstream household names.
+    If invert=True, more underground = higher score (for Deep Cuts).
     """
-    # Best case: Last.fm listener data available
+    tiers = LASTFM_TIERS_INVERTED if invert else LASTFM_TIERS
+
     lastfm_listeners = candidate.get("lastfm_listeners", 0)
     if lastfm_listeners > 0:
-        for max_listeners, score, label in LASTFM_TIERS:
+        for max_listeners, score, label in tiers:
             if lastfm_listeners < max_listeners:
                 return score
 
     # Fallback: MB search relevance score (inverted)
-    # High MB score = matches many broad searches = more well-known
-    # We INVERT this: high MB score -> LOW popularity score (penalize mainstream)
     mb_score = candidate.get("mb_score", 0)
     source_count = candidate.get("source_count", 1)
 
-    # Multi-source + high MB score = very likely mainstream
     if mb_score >= 90 and source_count >= 3:
-        return 0.1  # almost certainly mainstream
+        return 0.1
     elif mb_score >= 80 and source_count >= 2:
         return 0.3
     elif mb_score >= 70:
-        return 0.5  # probably well-known
+        return 0.5
     elif mb_score >= 50:
-        return 0.7  # could be breakout
+        return 0.7
     elif mb_score >= 30:
-        return 0.8  # likely indie
+        return 0.8
     else:
-        return 0.6  # very obscure (might be too niche)
+        return 0.6
 
 
 def compute_source_diversity(candidate: Dict[str, Any]) -> float:
-    """Score 0-1 based on how many sources found this candidate.
-
-    Found by 1 source: 0.3
-    Found by 2 sources: 0.6
-    Found by 3+ sources: 1.0
-    """
+    """Score 0-1 based on how many sources found this candidate."""
     count = candidate.get("source_count", 1)
     if count >= 3:
         return 1.0
@@ -142,42 +177,67 @@ def compute_source_diversity(candidate: Dict[str, Any]) -> float:
 
 
 def compute_momentum_score(candidate: Dict[str, Any]) -> float:
-    """Score 0-1 based on listener growth momentum.
-
-    Compares current Last.fm listeners to a previous snapshot.
-    >20% growth = 1.0 (breakout), 10-20% = 0.8, 0-10% = 0.6,
-    declining = 0.3, no data = 0.5 (neutral).
-    """
+    """Score 0-1 based on listener growth momentum."""
     current = candidate.get("lastfm_listeners", 0)
     previous = candidate.get("previous_listeners", 0)
 
     if not current or not previous:
-        return 0.5  # no data — neutral
+        return 0.5
 
     if previous == 0:
-        return 0.8  # new artist with listeners = positive signal
+        return 0.8
 
     growth = (current - previous) / previous
 
     if growth > 0.20:
-        return 1.0  # breakout
+        return 1.0
     elif growth > 0.10:
         return 0.8
     elif growth > 0.0:
         return 0.6
     else:
-        return 0.3  # declining
+        return 0.3
+
+
+def compute_recency_score(candidate: Dict[str, Any], max_age_months: int = 12) -> float:
+    """Score 0-1 based on how recently the artist's track was released.
+
+    Newer releases score higher. Used primarily for Rising Stars.
+    """
+    release_date = candidate.get("release_date", "")
+    if not release_date:
+        return 0.3  # no data — slight penalty
+
+    try:
+        if len(release_date) == 4:
+            rd = datetime.strptime(release_date, "%Y")
+        elif len(release_date) == 7:
+            rd = datetime.strptime(release_date, "%Y-%m")
+        else:
+            rd = datetime.strptime(release_date[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return 0.3
+
+    age_days = (datetime.now() - rd).days
+    max_age_days = max_age_months * 30
+
+    if age_days <= 0:
+        return 1.0
+    elif age_days <= 90:
+        return 1.0  # last 3 months — peak freshness
+    elif age_days <= 180:
+        return 0.8
+    elif age_days <= max_age_days:
+        return 0.6
+    else:
+        return 0.2  # older than max age
 
 
 def compute_feedback_boost(
     candidate: Dict[str, Any],
     liked_genres: Dict[str, int] = None,
 ) -> float:
-    """Small composite boost for candidates whose genres were positively received.
-
-    Returns a bonus (0.0-0.05) based on how many of the candidate's genres
-    appear in the liked genres from feedback.
-    """
+    """Small composite boost for candidates whose genres were positively received."""
     if not liked_genres:
         return 0.0
 
@@ -193,7 +253,6 @@ def compute_feedback_boost(
     if matches == 0:
         return 0.0
 
-    # Cap at 0.05 boost
     return min(matches * 0.02, 0.05)
 
 
@@ -201,38 +260,55 @@ def score_candidates(
     candidates: List[Dict[str, Any]],
     genre_weights: Dict[str, float],
     liked_genres: Dict[str, int] = None,
+    profile: str = "default",
 ) -> List[Dict[str, Any]]:
-    """Score all candidates and return them sorted by composite score descending.
+    """Score all candidates using the specified scoring profile.
 
-    Filters out candidates below the minimum genre match threshold.
+    Filters out candidates below the profile's minimum genre match threshold
+    and outside the listener range (if specified).
 
     Args:
         candidates: List of candidate dicts
         genre_weights: Taste profile weights
-        liked_genres: {genre: count} from feedback for bonus scoring (optional)
+        liked_genres: {genre: count} from feedback for bonus scoring
+        profile: Scoring profile name from SCORING_PROFILES
     """
+    prof = SCORING_PROFILES.get(profile, SCORING_PROFILES["default"])
+    weights = prof["weights"]
+    min_genre = prof["min_genre_match"]
+    listener_range = prof.get("listener_range")
+    invert_pop = prof.get("invert_popularity", False)
+
     scored = []
 
     for candidate in candidates:
+        # Listener range filter
+        if listener_range:
+            listeners = candidate.get("lastfm_listeners", 0)
+            lo, hi = listener_range
+            # Skip candidates outside range (but allow those with no data)
+            if listeners > 0 and (listeners < lo or listeners > hi):
+                continue
+
         genres = candidate.get("genres", [])
         genre_score = compute_genre_match(genres, genre_weights)
 
-        # Skip candidates with poor genre fit
-        if genre_score < MIN_GENRE_MATCH:
+        if genre_score < min_genre:
             continue
 
-        pop_score = compute_popularity_score(candidate)
+        pop_score = compute_popularity_score(candidate, invert=invert_pop)
         source_score = compute_source_diversity(candidate)
         momentum_score = compute_momentum_score(candidate)
+        recency_score = compute_recency_score(candidate)
 
         composite = (
-            genre_score * WEIGHT_GENRE
-            + pop_score * WEIGHT_POPULARITY
-            + source_score * WEIGHT_SOURCE_DIVERSITY
-            + momentum_score * WEIGHT_MOMENTUM
+            genre_score * weights.get("genre", 0)
+            + pop_score * weights.get("popularity", 0)
+            + source_score * weights.get("source_diversity", 0)
+            + momentum_score * weights.get("momentum", 0)
+            + recency_score * weights.get("recency", 0)
         )
 
-        # Feedback boost
         fb_boost = compute_feedback_boost(candidate, liked_genres)
         composite += fb_boost
 
@@ -240,14 +316,14 @@ def score_candidates(
         candidate["popularity_score"] = round(pop_score, 4)
         candidate["source_diversity_bonus"] = round(source_score, 4)
         candidate["momentum_score"] = round(momentum_score, 4)
+        candidate["recency_score"] = round(recency_score, 4)
         candidate["feedback_boost"] = round(fb_boost, 4)
         candidate["composite_score"] = round(composite, 4)
         scored.append(candidate)
 
-    # Sort descending by composite score
     scored.sort(key=lambda c: c["composite_score"], reverse=True)
 
-    logger.info("Scored %d candidates (filtered %d below genre threshold %.2f)",
-                len(scored), len(candidates) - len(scored), MIN_GENRE_MATCH)
+    logger.info("Scored %d candidates with profile '%s' (filtered %d below threshold)",
+                len(scored), profile, len(candidates) - len(scored))
 
     return scored

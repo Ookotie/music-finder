@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 

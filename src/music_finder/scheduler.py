@@ -10,7 +10,7 @@ Standalone usage (for dev/testing):
 
 import logging
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _run_scan_job(run_index: int = None) -> None:
     """
     logger.info("Scheduled music scan starting (run_index=%s)...", run_index)
     try:
-        from scanner import run_music_scan
+        from .scanner import run_music_scan
         result = run_music_scan(run_index=run_index)
 
         playlists = result.get("playlists", {})
@@ -50,8 +50,8 @@ def _run_scan_job(run_index: int = None) -> None:
     except Exception as e:
         logger.error("Scheduled music scan crashed: %s", e)
         try:
-            from notification import format_error_notification
-            from scanner import _try_send_telegram, _try_track_error
+            from .notification import format_error_notification
+            from .scanner import _try_send_telegram, _try_track_error
             _try_track_error(e, "music.scheduler")
             msg = format_error_notification([f"Scanner crashed: {e}"])
             _try_send_telegram(msg)
@@ -112,7 +112,7 @@ if __name__ == "__main__":
     logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
 
     print("Running music scan (standalone mode)...")
-    from scanner import run_music_scan
+    from .scanner import run_music_scan
 
     result = run_music_scan()
 

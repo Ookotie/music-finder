@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 

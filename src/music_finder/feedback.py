@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Set
 
 import spotipy
 
-import config
-import db
-from spotify_client import _count_request
+from . import config
+from . import db
+from .spotify_client import _count_request
 
 logger = logging.getLogger(__name__)
 

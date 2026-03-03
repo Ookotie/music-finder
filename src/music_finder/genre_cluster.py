@@ -9,7 +9,7 @@ import logging
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ def get_next_spotlight_genre(genre_weights: Dict[str, float] = None) -> str:
     Cycles through the user's top genre families, skipping the most recently used.
     Tracks history in the spotlight_history DB table.
     """
-    import db as _db
+    from . import db as _db
 
     # Get user's top genre families ranked by taste profile weight
     ranked_families = _rank_families_by_taste(genre_weights) if genre_weights else list(GENRE_FAMILIES.keys())

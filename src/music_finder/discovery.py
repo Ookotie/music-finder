@@ -15,10 +15,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import spotipy
 
-import config
-import db
-import lastfm_client
-import musicbrainz_client
+from . import config
+from . import db
+from . import lastfm_client
+from . import musicbrainz_client
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ def discover_from_spotify_search(
 
     logger.info("Discovering from %d genres via Spotify search...", len(top_genres))
 
-    from spotify_client import _count_request, SpotifyRateLimitError
+    from .spotify_client import _count_request, SpotifyRateLimitError
 
     candidates = {}
     for genre, weight in top_genres:
@@ -280,7 +280,7 @@ def discover_from_bandcamp(
     Zero Spotify API calls.
     """
     try:
-        import bandcamp_client
+        from . import bandcamp_client
     except ImportError:
         logger.info("bandcamp_client not available — skipping Bandcamp discovery")
         return []
@@ -300,7 +300,7 @@ def discover_from_blogs() -> List[Dict[str, Any]]:
     Zero Spotify API calls.
     """
     try:
-        import rss_client
+        from . import rss_client
     except ImportError:
         logger.info("rss_client not available — skipping blog RSS discovery")
         return []
@@ -328,7 +328,7 @@ def discover_from_spotify_recommendations(
         playlist_type: "rising_stars" (min_pop=30, max_pop=65) or
                        "deep_cuts" (max_pop=30)
     """
-    from spotify_client import get_recommendations, SpotifyRateLimitError
+    from .spotify_client import get_recommendations, SpotifyRateLimitError
 
     logger.info("Discovering from Spotify recommendations (type=%s)...", playlist_type)
 
@@ -435,7 +435,7 @@ def resolve_spotify_ids(
     Uses SQLite cache to avoid re-searching artists we've seen before.
     Tracks request count and stops before hitting rate limits.
     """
-    from spotify_client import _count_request, SpotifyRateLimitError
+    from .spotify_client import _count_request, SpotifyRateLimitError
 
     logger.info("Resolving Spotify IDs for %d candidates...", len(candidates))
 
@@ -642,7 +642,7 @@ def run_discovery(
         musicbrainz_client.enrich_artists_with_genres(candidates, "discovery")
 
     # Score candidates BEFORE resolving Spotify IDs (to minimize API calls)
-    from scorer import score_candidates
+    from .scorer import score_candidates
     scored = score_candidates(candidates, genre_weights)
     logger.info("Scored %d candidates pre-Spotify resolution", len(scored))
 

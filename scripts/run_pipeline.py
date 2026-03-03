@@ -13,13 +13,13 @@ import json
 import logging
 import sys
 
-import config
-import db
-import spotify_client
-from discovery import run_discovery
-from notification import format_notification
-from playlist_builder import build_playlist
-from scanner import run_music_scan
+from music_finder import config
+from music_finder import db
+from music_finder import spotify_client
+from music_finder.discovery import run_discovery
+from music_finder.notification import format_notification
+from music_finder.playlist_builder import build_playlist
+from music_finder.scanner import run_music_scan
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,13 +205,13 @@ def run_dry():
 
     Shows how candidates would be scored under each profile.
     """
-    import lastfm_client
-    import musicbrainz_client
-    from discovery import (
+    from music_finder import lastfm_client
+    from music_finder import musicbrainz_client
+    from music_finder.discovery import (
         discover_from_musicbrainz, discover_from_lastfm,
         _merge_candidates, _filter_mainstream,
     )
-    from scorer import score_candidates
+    from music_finder.scorer import score_candidates
 
     profile = dict(db.get_taste_profile())
     if not profile:
@@ -255,7 +255,7 @@ def run_dry():
 
 def run_feedback_only():
     """Run feedback check only (no discovery or playlists)."""
-    from feedback import check_feedback, apply_feedback_to_taste_profile, get_feedback_summary
+    from music_finder.feedback import check_feedback, apply_feedback_to_taste_profile, get_feedback_summary
 
     logger.info("Connecting to Spotify...")
     try:

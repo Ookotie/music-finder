@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Tuple
 
 import spotipy
 
-import config
-import musicbrainz_client
-import spotify_client
+from . import config
+from . import musicbrainz_client
+from . import spotify_client
 
 logger = logging.getLogger(__name__)
 

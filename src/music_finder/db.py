@@ -6,7 +6,7 @@ import os
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 

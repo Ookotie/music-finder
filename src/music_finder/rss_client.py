@@ -11,8 +11,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import config
-import db
+from . import config
+from . import db
 
 logger = logging.getLogger(__name__)
 

@@ -18,15 +18,15 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import config
-import db
-import spotify_client as sp_client
-from discovery import run_discovery
-from feedback import check_feedback, apply_feedback_to_taste_profile, get_feedback_summary
-from genre_cluster import get_next_spotlight_genre, get_spotlight_keywords
-from notification import format_scan_notification, format_error_notification
-from playlist_builder import build_playlist_from_profile
-from scorer import score_candidates
+from . import config
+from . import db
+from . import spotify_client as sp_client
+from .discovery import run_discovery
+from .feedback import check_feedback, apply_feedback_to_taste_profile, get_feedback_summary
+from .genre_cluster import get_next_spotlight_genre, get_spotlight_keywords
+from .notification import format_scan_notification, format_error_notification
+from .playlist_builder import build_playlist_from_profile
+from .scorer import score_candidates
 
 logger = logging.getLogger(__name__)
 

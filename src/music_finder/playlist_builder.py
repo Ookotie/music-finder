@@ -16,8 +16,8 @@ from typing import Any, Dict, List, Optional
 import requests as _requests
 import spotipy
 
-import config
-import db
+from . import config
+from . import db
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ def get_top_track(
                        preview_url, release_date
     Returns None if no track found.
     """
-    from spotify_client import _count_request, SpotifyRateLimitError
+    from .spotify_client import _count_request, SpotifyRateLimitError
 
     try:
         _count_request("search")
@@ -239,7 +239,7 @@ def _create_spotify_playlist(
     description: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Create a Spotify playlist and add tracks using raw HTTP."""
-    from spotify_client import _count_request
+    from .spotify_client import _count_request
 
     if description is None:
         description = (

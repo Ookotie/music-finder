@@ -68,5 +68,5 @@ SOURCE_WEIGHTS = {
     "followed_artists": 0.5,
 }
 
-# SQLite database path
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "music_finder.db")
+# SQLite database path — configurable via env var for installed-package usage
+DB_PATH = os.getenv("MUSIC_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "music_finder.db"))

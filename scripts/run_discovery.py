@@ -7,9 +7,9 @@ Usage:
 import logging
 import sys
 
-import db
-import spotify_client
-from discovery import run_discovery
+from music_finder import db
+from music_finder import spotify_client
+from music_finder.discovery import run_discovery
 
 logging.basicConfig(
     level=logging.INFO,

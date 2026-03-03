@@ -7,9 +7,9 @@ Usage:
 import logging
 import sys
 
-import db
-import spotify_client
-import taste_profiler
+from music_finder import db
+from music_finder import spotify_client
+from music_finder import taste_profiler
 
 logging.basicConfig(
     level=logging.INFO,

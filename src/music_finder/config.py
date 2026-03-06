@@ -18,6 +18,7 @@ SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8888/callback"
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
 # Scheduling (for oni-hub integration)
+TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
 MUSIC_SCAN_DAY = os.getenv("MUSIC_SCAN_DAY", "fri")  # legacy single-day
 MUSIC_SCAN_DAYS = os.getenv("MUSIC_SCAN_DAYS", "sun,tue,thu")  # 3x/week
 MUSIC_SCAN_HOUR = int(os.getenv("MUSIC_SCAN_HOUR", "21"))

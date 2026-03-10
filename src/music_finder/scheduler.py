@@ -119,11 +119,11 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Candidates discovered: {result['candidates_discovered']}")
 
+    print(f"Genre cluster: {result.get('genre_cluster', 'N/A')}")
     playlists = result.get("playlists", {})
     for ptype, label in [
-        ("rising_stars", "Rising Stars"),
         ("deep_cuts", "Deep Cuts"),
-        ("genre_spotlight", "Genre Spotlight"),
+        ("fresh_finds", "Fresh Finds"),
     ]:
         p = playlists.get(ptype)
         if p:

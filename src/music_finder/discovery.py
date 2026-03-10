@@ -1,10 +1,15 @@
 """Discovery Engine — Multi-source candidate gathering.
 
-Discovers emerging artists by searching genres from the taste profile.
-Sources:
+Genre-first, two-funnel architecture:
+  - Deep Cuts: hidden gems from any era, filtered to a specific genre cluster
+  - Fresh Finds: what's breaking NOW, filtered to a specific genre cluster
+
+Sources (all working in Spotify dev mode):
   1. MusicBrainz tag search (free, no API key)
-  2. Spotify search (for Spotify ID resolution)
-  3. Last.fm similar artists + tag search (when API key available)
+  2. Last.fm similar artists + tag search
+  3. Bandcamp discover API (no API key)
+  4. Music blog RSS feeds
+  5. Spotify search (for ID resolution + fresh finds discovery)
 """
 
 import logging
@@ -313,116 +318,6 @@ def discover_from_blogs() -> List[Dict[str, Any]]:
         return []
 
 
-def discover_from_spotify_recommendations(
-    sp: spotipy.Spotify,
-    seed_artists: List[Dict[str, Any]],
-    genre_weights: Dict[str, float],
-    playlist_type: str = "rising_stars",
-) -> List[Dict[str, Any]]:
-    """Discover candidates via Spotify's recommendations endpoint.
-
-    1 API call returns up to 100 tracks WITH full metadata — vastly more
-    efficient than search→resolve→fetch per artist.
-
-    Args:
-        playlist_type: "rising_stars" (min_pop=30, max_pop=65) or
-                       "deep_cuts" (max_pop=30)
-    """
-    from .spotify_client import get_recommendations, SpotifyRateLimitError
-
-    logger.info("Discovering from Spotify recommendations (type=%s)...", playlist_type)
-
-    # Build seeds: top 5 artists from taste profile that have Spotify IDs
-    artist_seeds = [
-        a["spotify_id"] for a in seed_artists
-        if a.get("spotify_id")
-    ][:5]
-
-    # Top genre seeds (Spotify uses specific genre names)
-    skip_tags = {"english", "british", "american", "canadian", "australian",
-                 "german", "french", "swedish", "nuno", "2010s", "2000s",
-                 "1990s", "1980s", "seen live", "favorites"}
-    genre_seeds = [
-        g for g, _ in sorted(genre_weights.items(), key=lambda x: -x[1])
-        if g.lower() not in skip_tags
-    ][:3]
-
-    # Set popularity params based on playlist type
-    rec_kwargs = {}
-    if playlist_type == "rising_stars":
-        rec_kwargs = {"min_popularity": 30, "max_popularity": 65}
-    elif playlist_type == "deep_cuts":
-        rec_kwargs = {"max_popularity": 30}
-
-    all_tracks = []
-
-    # Strategy 1: Seed with top artists
-    if artist_seeds:
-        try:
-            tracks = get_recommendations(
-                sp, seed_artists=artist_seeds, limit=100, **rec_kwargs
-            )
-            all_tracks.extend(tracks)
-        except SpotifyRateLimitError:
-            raise
-        except Exception as e:
-            logger.warning("Spotify recs (artist seeds) failed: %s", e)
-
-    # Strategy 2: Seed with genres (different results)
-    if genre_seeds:
-        try:
-            tracks = get_recommendations(
-                sp, seed_genres=genre_seeds, limit=100, **rec_kwargs
-            )
-            all_tracks.extend(tracks)
-        except SpotifyRateLimitError:
-            raise
-        except Exception as e:
-            logger.warning("Spotify recs (genre seeds) failed: %s", e)
-
-    # Convert tracks to candidate format
-    candidates = {}
-    for track in all_tracks:
-        aid = track.get("artist_spotify_id")
-        if not aid:
-            continue
-        name_key = track["artist_name"].lower().strip()
-        if name_key in ("various artists",):
-            continue
-
-        if name_key in candidates:
-            candidates[name_key]["discovery_sources"].add(f"spotify_recs:{playlist_type}")
-        else:
-            candidates[name_key] = {
-                "name": track["artist_name"],
-                "spotify_id": aid,
-                "mb_id": None,
-                "genres": [],
-                "discovery_sources": {f"spotify_recs:{playlist_type}"},
-                "mb_score": 0,
-                # Store the track directly — no separate fetch needed
-                "_rec_track": {
-                    "track_id": track["track_id"],
-                    "track_name": track["track_name"],
-                    "artist_name": track["artist_name"],
-                    "duration_ms": track.get("duration_ms", 0),
-                    "preview_url": track.get("preview_url"),
-                    "release_date": track.get("release_date", ""),
-                },
-            }
-            # Use the track's release_date for recency scoring
-            if track.get("release_date"):
-                candidates[name_key]["release_date"] = track["release_date"]
-
-    result = []
-    for c in candidates.values():
-        c["source_count"] = len(c["discovery_sources"])
-        c["discovery_sources"] = list(c["discovery_sources"])
-        result.append(c)
-
-    logger.info("  Spotify recommendations: %d unique candidates from %d tracks",
-                len(result), len(all_tracks))
-    return result
 
 
 def resolve_spotify_ids(
@@ -540,182 +435,293 @@ def filter_already_recommended(
     return filtered
 
 
-def run_discovery(
+def discover_deep_cuts(
     sp: spotipy.Spotify,
-    run_index: int = None,
+    genre_cluster: str,
+    genre_keywords: set,
+    genre_weights: Dict[str, float],
+    seed_artists: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Run the full discovery pipeline.
+    """Discover hidden gems (any era) filtered to a genre cluster.
 
-    Args:
-        sp: Authenticated Spotify client
-        run_index: 0, 1, or 2 — rotates which seeds/genres drive discovery.
-                   None = use all (backwards compatible).
+    Sources: Last.fm similar artists, MusicBrainz tag search,
+    Bandcamp "top" sort, Last.fm tag.getTopArtists.
 
-    Returns scored and ranked candidates ready for playlist building.
-    Candidates from Spotify recommendations carry their track pre-attached
-    in the `_rec_track` field (no separate track fetch needed).
+    Returns scored candidates with Spotify IDs, ready for playlist building.
     """
-    # Load taste profile and seed artists from DB
-    genre_weights = dict(db.get_taste_profile())
-    seed_artists = db.get_seed_artists()
-    seed_ids = {a["spotify_id"] for a in seed_artists}
+    from .genre_cluster import filter_candidates_to_cluster, get_cluster_bandcamp_slugs
+    from .scorer import score_candidates
+
+    seed_ids = {a["spotify_id"] for a in seed_artists if a.get("spotify_id")}
     seed_names = {a["name"].lower().strip() for a in seed_artists}
 
-    if not genre_weights:
-        logger.error("No taste profile found. Run taste profiler first.")
-        return []
+    # Filter seeds to those whose genres overlap with the cluster
+    filtered_seeds = []
+    for a in seed_artists:
+        a_genres = a.get("genres", [])
+        if isinstance(a_genres, str):
+            import json
+            try:
+                a_genres = json.loads(a_genres)
+            except (json.JSONDecodeError, TypeError):
+                a_genres = []
+        a_genres_lower = {g.lower().strip() for g in a_genres}
+        if a_genres_lower & genre_keywords:
+            filtered_seeds.append(a)
+    if not filtered_seeds:
+        filtered_seeds = seed_artists[:10]  # fallback
+    logger.info("Deep Cuts: %d/%d seeds match cluster '%s'",
+                len(filtered_seeds), len(seed_artists), genre_cluster)
 
-    logger.info("Loaded taste profile: %d genres, %d seed artists (run_index=%s)",
-                len(genre_weights), len(seed_ids), run_index)
+    # Build genre weights filtered to cluster keywords
+    cluster_weights = {g: w for g, w in genre_weights.items()
+                       if g.lower().strip() in genre_keywords
+                       or any(kw in g.lower() or g.lower() in kw for kw in genre_keywords)}
+    if not cluster_weights:
+        cluster_weights = genre_weights  # fallback
 
-    # Rotate seeds and genres based on run_index for variety across runs
-    rotated_seeds = _rotate_seeds(seed_artists, run_index)
-    rotated_weights = _rotate_genres(genre_weights, run_index)
-
-    # Gather candidates from all sources
     all_candidates = []
 
-    # Source 1: MusicBrainz tag search (free, no API key)
-    mb_candidates = discover_from_musicbrainz(rotated_weights, seed_ids)
-    all_candidates.extend(mb_candidates)
-
-    # Source 2: Last.fm (if configured)
-    lfm_candidates = discover_from_lastfm(rotated_weights, rotated_seeds)
+    # Source 1: Last.fm similar artists (on filtered seeds)
+    lfm_candidates = discover_from_lastfm(cluster_weights, filtered_seeds)
     all_candidates.extend(lfm_candidates)
 
-    # Source 3: Bandcamp (no API key, no Spotify calls)
-    try:
-        bc_candidates = discover_from_bandcamp(rotated_weights)
-        all_candidates.extend(bc_candidates)
-    except Exception as e:
-        logger.warning("Bandcamp source failed (non-fatal): %s", e)
+    # Source 2: MusicBrainz tag search (cluster keywords only)
+    mb_candidates = discover_from_musicbrainz(cluster_weights, seed_ids)
+    all_candidates.extend(mb_candidates)
 
-    # Source 4: Music blog RSS feeds (no API key, no Spotify calls)
+    # Source 3: Bandcamp "top" sort (proven quality, any era)
+    try:
+        from . import bandcamp_client
+        bc_slugs = get_cluster_bandcamp_slugs(genre_cluster)
+        for slug in bc_slugs:
+            try:
+                artists = bandcamp_client.get_discover_artists(slug, sort="top")
+                for artist in artists:
+                    name_key = artist["name"].lower().strip()
+                    if name_key in ("various artists", "[unknown]", "unknown artist", "va"):
+                        continue
+                    all_candidates.append({
+                        "name": artist["name"],
+                        "mb_id": None,
+                        "spotify_id": None,
+                        "genres": [slug],
+                        "discovery_sources": [f"bandcamp_top:{slug}"],
+                        "source_count": 1,
+                        "mb_score": 0,
+                    })
+            except Exception as e:
+                logger.warning("Bandcamp top '%s' failed: %s", slug, e)
+    except ImportError:
+        pass
+
+    # Source 4: Last.fm tag.getTopArtists for each keyword (top 5 keywords)
+    if config.LASTFM_API_KEY:
+        top_keywords = sorted(cluster_weights.items(), key=lambda x: -x[1])[:5]
+        for kw, _ in top_keywords:
+            try:
+                tag_artists = lastfm_client.get_tag_top_artists(kw, limit=30)
+                for a in tag_artists:
+                    name_key = a["name"].lower().strip()
+                    if name_key in ("various artists",):
+                        continue
+                    all_candidates.append({
+                        "name": a["name"],
+                        "mb_id": None,
+                        "spotify_id": None,
+                        "genres": [],
+                        "discovery_sources": [f"lastfm_tag_top:{kw}"],
+                        "source_count": 1,
+                        "mb_score": 0,
+                        "lastfm_listeners": a.get("listeners", 0),
+                    })
+            except Exception as e:
+                logger.warning("Last.fm tag top '%s' failed: %s", kw, e)
+
+    if not all_candidates:
+        logger.warning("Deep Cuts: no candidates from any source")
+        return []
+
+    # Merge, filter, enrich, score, resolve
+    candidates = _merge_candidates(all_candidates)
+    candidates = [c for c in candidates if c["name"].lower().strip() not in seed_names]
+    candidates = _filter_mainstream(candidates)
+
+    # Genre coherence filter
+    candidates = filter_candidates_to_cluster(candidates, genre_cluster)
+    if len(candidates) < 15:
+        logger.warning("Deep Cuts: only %d after genre filter, skipping strict filter", len(candidates))
+        candidates = _merge_candidates(all_candidates)
+        candidates = [c for c in candidates if c["name"].lower().strip() not in seed_names]
+        candidates = _filter_mainstream(candidates)
+
+    lastfm_client.enrich_with_listeners(candidates, "deep_cuts")
+    musicbrainz_client.enrich_artists_with_genres(
+        [c for c in candidates if not c.get("genres")], "deep_cuts"
+    )
+
+    scored = score_candidates(candidates, genre_weights, profile="deep_cuts")
+
+    top_n = min(len(scored), 150)
+    resolved = resolve_spotify_ids(sp, scored[:top_n], seed_ids)
+    resolved = filter_already_recommended(resolved)
+    resolved.sort(key=lambda c: c["composite_score"], reverse=True)
+
+    logger.info("Deep Cuts discovery complete: %d candidates", len(resolved))
+    return resolved
+
+
+def discover_fresh_finds(
+    sp: spotipy.Spotify,
+    genre_cluster: str,
+    genre_keywords: set,
+    genre_weights: Dict[str, float],
+    seed_artists: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Discover what's breaking NOW, filtered to a genre cluster.
+
+    Sources: Blog RSS, Bandcamp "new" sort, Spotify search + year filter,
+    Last.fm tags (momentum filter).
+
+    Returns scored candidates with Spotify IDs, ready for playlist building.
+    """
+    from .genre_cluster import filter_candidates_to_cluster, get_cluster_bandcamp_slugs
+    from .scorer import score_candidates
+    from .spotify_client import _count_request, SpotifyRateLimitError
+    from datetime import datetime
+
+    seed_ids = {a["spotify_id"] for a in seed_artists if a.get("spotify_id")}
+    seed_names = {a["name"].lower().strip() for a in seed_artists}
+
+    cluster_weights = {g: w for g, w in genre_weights.items()
+                       if g.lower().strip() in genre_keywords
+                       or any(kw in g.lower() or g.lower() in kw for kw in genre_keywords)}
+    if not cluster_weights:
+        cluster_weights = genre_weights
+
+    all_candidates = []
+
+    # Source 1: Blog RSS → enrich genres via MusicBrainz → genre filter
     try:
         blog_candidates = discover_from_blogs()
         all_candidates.extend(blog_candidates)
     except Exception as e:
-        logger.warning("Blog RSS source failed (non-fatal): %s", e)
+        logger.warning("Blog RSS failed (non-fatal): %s", e)
 
-    # Source 5: Spotify recommendations — rising stars candidates
+    # Source 2: Bandcamp "new" sort (newest releases)
     try:
-        rising_recs = discover_from_spotify_recommendations(
-            sp, seed_artists, rotated_weights, playlist_type="rising_stars"
-        )
-        all_candidates.extend(rising_recs)
-    except Exception as e:
-        logger.warning("Spotify recs (rising) failed (non-fatal): %s", e)
+        from . import bandcamp_client
+        bc_slugs = get_cluster_bandcamp_slugs(genre_cluster)
+        for slug in bc_slugs:
+            try:
+                artists = bandcamp_client.get_discover_artists(slug, sort="new")
+                for artist in artists:
+                    name_key = artist["name"].lower().strip()
+                    if name_key in ("various artists", "[unknown]", "unknown artist", "va"):
+                        continue
+                    all_candidates.append({
+                        "name": artist["name"],
+                        "mb_id": None,
+                        "spotify_id": None,
+                        "genres": [slug],
+                        "discovery_sources": [f"bandcamp_new:{slug}"],
+                        "source_count": 1,
+                        "mb_score": 0,
+                    })
+            except Exception as e:
+                logger.warning("Bandcamp new '%s' failed: %s", slug, e)
+    except ImportError:
+        pass
 
-    # Source 6: Spotify recommendations — deep cuts candidates
-    try:
-        deep_recs = discover_from_spotify_recommendations(
-            sp, seed_artists, rotated_weights, playlist_type="deep_cuts"
-        )
-        all_candidates.extend(deep_recs)
-    except Exception as e:
-        logger.warning("Spotify recs (deep) failed (non-fatal): %s", e)
+    # Source 3: Spotify search with genre keywords + year filter
+    current_year = datetime.now().year
+    year_filter = f"{current_year - 1}-{current_year}"
+    top_keywords = sorted(cluster_weights.items(), key=lambda x: -x[1])[:5]
+    for kw, _ in top_keywords:
+        try:
+            _count_request("search")
+            result = sp.search(q=f"{kw} year:{year_filter}", type="artist", limit=10)
+            items = result.get("artists", {}).get("items", [])
+            for item in items:
+                sid = item["id"]
+                if sid in seed_ids:
+                    continue
+                name_key = item["name"].lower().strip()
+                if name_key in ("various artists",):
+                    continue
+                all_candidates.append({
+                    "name": item["name"],
+                    "mb_id": None,
+                    "spotify_id": sid,
+                    "genres": item.get("genres", []),
+                    "discovery_sources": [f"spotify_fresh:{kw}"],
+                    "source_count": 1,
+                    "mb_score": 50,
+                })
+        except SpotifyRateLimitError:
+            logger.warning("Rate limit during Fresh Finds Spotify search")
+            break
+        except Exception as e:
+            logger.warning("Spotify search '%s' failed: %s", kw, e)
+
+    # Source 4: Last.fm tag search (momentum/recent)
+    if config.LASTFM_API_KEY:
+        for kw, _ in top_keywords:
+            try:
+                tag_artists = lastfm_client.get_tag_top_artists(kw, limit=20)
+                for a in tag_artists:
+                    name_key = a["name"].lower().strip()
+                    if name_key in ("various artists",):
+                        continue
+                    all_candidates.append({
+                        "name": a["name"],
+                        "mb_id": None,
+                        "spotify_id": None,
+                        "genres": [],
+                        "discovery_sources": [f"lastfm_fresh:{kw}"],
+                        "source_count": 1,
+                        "mb_score": 0,
+                        "lastfm_listeners": a.get("listeners", 0),
+                    })
+            except Exception as e:
+                logger.warning("Last.fm fresh tag '%s' failed: %s", kw, e)
 
     if not all_candidates:
-        logger.error("No candidates discovered from any source")
+        logger.warning("Fresh Finds: no candidates from any source")
         return []
 
-    # Deduplicate across sources
+    # Merge, filter, enrich, score, resolve
     candidates = _merge_candidates(all_candidates)
-    logger.info("After deduplication: %d unique candidates", len(candidates))
-
-    # Filter out seed artists by name (in case Spotify ID wasn't set yet)
-    before = len(candidates)
     candidates = [c for c in candidates if c["name"].lower().strip() not in seed_names]
-    if len(candidates) < before:
-        logger.info("  Removed %d seed artists by name", before - len(candidates))
-
-    # Filter out mainstream artists
     candidates = _filter_mainstream(candidates)
 
-    # Enrich with Last.fm listener data (best popularity signal)
-    lastfm_client.enrich_with_listeners(candidates, "pre-scoring")
-
-    # Enrich candidates missing genres via MusicBrainz (Spotify search ones have none)
+    # Enrich genres for candidates that have none (blog/bandcamp/lastfm)
     needs_genres = [c for c in candidates if not c.get("genres")]
     if needs_genres:
-        logger.info("Enriching %d candidates with MusicBrainz genres...", len(needs_genres))
-        musicbrainz_client.enrich_artists_with_genres(candidates, "discovery")
+        musicbrainz_client.enrich_artists_with_genres(needs_genres, "fresh_finds")
 
-    # Score candidates BEFORE resolving Spotify IDs (to minimize API calls)
-    from .scorer import score_candidates
-    scored = score_candidates(candidates, genre_weights)
-    logger.info("Scored %d candidates pre-Spotify resolution", len(scored))
+    # Genre coherence filter
+    candidates = filter_candidates_to_cluster(candidates, genre_cluster)
+    if len(candidates) < 15:
+        logger.warning("Fresh Finds: only %d after genre filter, skipping strict filter", len(candidates))
+        candidates = _merge_candidates(all_candidates)
+        candidates = [c for c in candidates if c["name"].lower().strip() not in seed_names]
+        candidates = _filter_mainstream(candidates)
+        needs_genres = [c for c in candidates if not c.get("genres")]
+        if needs_genres:
+            musicbrainz_client.enrich_artists_with_genres(needs_genres, "fresh_finds_fallback")
 
-    # Resolve Spotify IDs for top 200 candidates — batch endpoints make this
-    # affordable (4 calls for 200 artists vs 200 individual searches).
-    top_n = min(len(scored), 200)
-    top_candidates = scored[:top_n]
-    logger.info("Resolving Spotify IDs for top %d candidates...", top_n)
-    resolved = resolve_spotify_ids(sp, top_candidates, seed_ids)
+    lastfm_client.enrich_with_listeners(candidates, "fresh_finds")
 
-    # Filter cooldown (global — per-playlist cooldown applied later in scanner)
+    scored = score_candidates(candidates, genre_weights, profile="fresh_finds")
+
+    top_n = min(len(scored), 100)
+    resolved = resolve_spotify_ids(sp, scored[:top_n], seed_ids)
     resolved = filter_already_recommended(resolved)
-
-    # Re-sort after filtering
     resolved.sort(key=lambda c: c["composite_score"], reverse=True)
 
-    logger.info("Discovery complete: %d scored candidates with Spotify IDs", len(resolved))
+    logger.info("Fresh Finds discovery complete: %d candidates", len(resolved))
     return resolved
-
-
-def _rotate_seeds(
-    seed_artists: List[Dict[str, Any]],
-    run_index: int = None,
-) -> List[Dict[str, Any]]:
-    """Rotate which seed artists drive similar-artist search.
-
-    Run 0 (Sun): seeds 0-14
-    Run 1 (Tue): seeds 15-29
-    Run 2 (Thu): seeds 30-44
-    None: all seeds (backwards compatible)
-    """
-    if run_index is None:
-        return seed_artists
-
-    start = run_index * 15
-    end = start + 15
-    rotated = seed_artists[start:end]
-
-    # If not enough seeds in this slice, wrap around
-    if len(rotated) < 10 and len(seed_artists) > 0:
-        rotated = seed_artists[start:] + seed_artists[:max(10 - len(rotated), 0)]
-
-    logger.info("  Run %d: using seeds %d-%d (%d artists)",
-                run_index, start, start + len(rotated) - 1, len(rotated))
-    return rotated
-
-
-def _rotate_genres(
-    genre_weights: Dict[str, float],
-    run_index: int = None,
-) -> Dict[str, float]:
-    """Rotate which genre slice drives tag-based discovery.
-
-    Run 0 (Sun): genres 0-19
-    Run 1 (Tue): genres 5-24
-    Run 2 (Thu): genres 10-29
-    None: all genres (backwards compatible)
-    """
-    if run_index is None:
-        return genre_weights
-
-    sorted_genres = sorted(genre_weights.items(), key=lambda x: -x[1])
-    start = run_index * 5
-    end = start + 20
-    sliced = sorted_genres[start:end]
-
-    # If not enough genres, wrap
-    if len(sliced) < 15 and len(sorted_genres) > 0:
-        sliced = sorted_genres[start:] + sorted_genres[:max(15 - len(sliced), 0)]
-
-    logger.info("  Run %d: using genres %d-%d (%d genres)",
-                run_index, start, start + len(sliced) - 1, len(sliced))
-    return dict(sliced)
 
 
 def _filter_mainstream(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -829,9 +835,6 @@ def _merge_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 existing["lastfm_match"] = max(
                     existing.get("lastfm_match", 0), c["lastfm_match"]
                 )
-            # Keep pre-fetched track from Spotify recommendations
-            if c.get("_rec_track") and not existing.get("_rec_track"):
-                existing["_rec_track"] = c["_rec_track"]
             # Keep release_date if available
             if c.get("release_date") and not existing.get("release_date"):
                 existing["release_date"] = c["release_date"]

@@ -226,6 +226,69 @@ def get_spotlight_keywords(genre_family: str) -> set:
     return GENRE_FAMILIES.get(genre_family, set())
 
 
+def filter_candidates_to_cluster(
+    candidates: List[Dict[str, Any]],
+    family_name: str,
+) -> List[Dict[str, Any]]:
+    """Filter candidates to only those matching a genre family.
+
+    Uses keyword matching: a candidate matches if any of its genres
+    overlap with the family's keyword set (exact or substring match).
+
+    Returns filtered list (does not modify originals).
+    """
+    keywords = GENRE_FAMILIES.get(family_name, set())
+    if not keywords:
+        logger.warning("Unknown genre family '%s' — returning all candidates", family_name)
+        return candidates
+
+    filtered = []
+    for c in candidates:
+        candidate_genres = c.get("genres", [])
+        if isinstance(candidate_genres, str):
+            import json
+            try:
+                candidate_genres = json.loads(candidate_genres)
+            except (json.JSONDecodeError, TypeError):
+                candidate_genres = []
+
+        candidate_genres_lower = {g.lower().strip() for g in candidate_genres}
+        match = False
+        for cg in candidate_genres_lower:
+            if cg in keywords:
+                match = True
+                break
+            for kw in keywords:
+                if kw in cg or cg in kw:
+                    match = True
+                    break
+            if match:
+                break
+        if match:
+            filtered.append(c)
+
+    logger.info("Genre filter '%s': %d/%d candidates passed",
+                family_name, len(filtered), len(candidates))
+    return filtered
+
+
+# Map genre families to Bandcamp slugs for targeted discovery
+_FAMILY_BANDCAMP_SLUGS = {
+    "Electronic / House": ["electronic"],
+    "Techno / Dark Electronic": ["electronic", "industrial", "dark-wave"],
+    "Indie / Alternative": ["alternative", "rock"],
+    "Synth & Electropop": ["electronic", "pop"],
+    "Ambient / Downtempo": ["ambient", "electronic"],
+    "Hip-Hop / R&B": ["hip-hop-rap", "r-b-soul"],
+    "Rock / Metal": ["rock", "metal", "punk"],
+}
+
+
+def get_cluster_bandcamp_slugs(family_name: str) -> List[str]:
+    """Get Bandcamp genre slugs relevant to a genre family."""
+    return _FAMILY_BANDCAMP_SLUGS.get(family_name, ["electronic"])
+
+
 def _find_nearest_cluster(
     orphans: List[Dict[str, Any]],
     large_clusters: Dict[str, List[Dict[str, Any]]],

@@ -1,6 +1,6 @@
 """Playlist Builder — Creates Spotify playlists from scored candidates.
 
-Multi-playlist pipeline: Rising Stars, Deep Cuts, Genre Spotlight.
+Two-playlist pipeline: Deep Cuts + Fresh Finds, genre-coherent.
 Uses track caching to minimize API calls on subsequent runs.
 
 Note: Spotify's Feb 2026 API changes deprecated several endpoints used by
@@ -80,11 +80,7 @@ def fetch_tracks_for_candidates(
     candidates: List[Dict[str, Any]],
     max_tracks: int = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch top tracks for candidates. Uses cache first, then API for misses.
-
-    Candidates with a `_rec_track` field (from Spotify recommendations) skip
-    the API call entirely — the track was already fetched during discovery.
-    """
+    """Fetch top tracks for candidates. Uses cache first, then API for misses."""
     if max_tracks is None:
         max_tracks = config.PLAYLIST_SIZE
 
@@ -106,20 +102,7 @@ def fetch_tracks_for_candidates(
             skipped += 1
             continue
 
-        # Priority 1: Pre-attached track from Spotify recommendations
-        rec_track = candidate.get("_rec_track")
-        if rec_track:
-            track = rec_track.copy()
-            track["artist_spotify_id"] = sid
-            track["composite_score"] = candidate.get("composite_score", 0)
-            track["genre_match_score"] = candidate.get("genre_match_score", 0)
-            track["artist_name"] = candidate.get("name", track.get("artist_name", ""))
-            track["artist_genres"] = json.dumps(candidate.get("genres", []))
-            tracks.append(track)
-            new_cache_entries.append(track)
-            continue
-
-        # Priority 2: Cached track
+        # Priority 1: Cached track
         if sid in cached_tracks:
             track = cached_tracks[sid].copy()
             track["artist_spotify_id"] = sid
@@ -131,7 +114,7 @@ def fetch_tracks_for_candidates(
             cache_hits += 1
             continue
 
-        # Priority 3: API call
+        # Priority 2: API call
         try:
             track = get_top_track(sp, candidate["name"], sid)
         except Exception:

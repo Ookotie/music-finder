@@ -57,6 +57,19 @@ SCORING_PROFILES = {
         "max_release_age_months": None,
         "invert_popularity": False,
     },
+    "fresh_finds": {
+        "weights": {
+            "genre": 0.30,
+            "recency": 0.30,
+            "momentum": 0.20,
+            "source_diversity": 0.10,
+            "popularity": 0.10,
+        },
+        "min_genre_match": 0.15,
+        "listener_range": (5_000, 2_000_000),
+        "max_release_age_months": 12,
+        "invert_popularity": False,
+    },
     "default": {
         "weights": {
             "genre": 0.4,

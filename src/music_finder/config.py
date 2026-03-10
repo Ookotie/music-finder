@@ -30,9 +30,8 @@ ARTIST_COOLDOWN_WEEKS = int(os.getenv("ARTIST_COOLDOWN_WEEKS", "3"))
 SPOTIFY_MAX_REQUESTS = int(os.getenv("SPOTIFY_MAX_REQUESTS", "350"))
 
 # Per-playlist target sizes
-RISING_STARS_SIZE = int(os.getenv("RISING_STARS_SIZE", "30"))
-DEEP_CUTS_SIZE = int(os.getenv("DEEP_CUTS_SIZE", "30"))
-GENRE_SPOTLIGHT_SIZE = int(os.getenv("GENRE_SPOTLIGHT_SIZE", "20"))
+DEEP_CUTS_SIZE = int(os.getenv("DEEP_CUTS_SIZE", "20"))
+FRESH_FINDS_SIZE = int(os.getenv("FRESH_FINDS_SIZE", "20"))
 
 # Rising Stars: only recent releases
 RISING_STARS_MAX_AGE_MONTHS = int(os.getenv("RISING_STARS_MAX_AGE_MONTHS", "12"))
